@@ -89,6 +89,38 @@ public typealias Flux2ProgressCallback = @Sendable (Int, Int) -> Void
 /// Checkpoint callback for saving intermediate images (step, image)
 public typealias Flux2CheckpointCallback = @Sendable (Int, CGImage) -> Void
 
+// =====================================================================
+// K4D LOCAL PATCH — reference channel mask (2026-05-17)
+//
+// Phase 1.1 of the Klein attention-control surface work. Klein's
+// patchified reference latent is `[1, 128, H/16, W/16]`. Per
+// capitan01R/ComfyUI-Flux2Klein-Enhancer's reverse-engineering:
+// channels 0–63 carry structure/layout, channels 64–127 carry
+// texture/detail. Zeroing one half lets a donor contribute only
+// structure (low) or only texture (high) without changing the
+// surrounding pipeline.
+//
+// Applied in `encodeReferenceImages` between BatchNorm and pack.
+// Per-pipeline setting so K4D can flip it from CLI without
+// changing every public generate method's signature.
+//
+// See `docs/klein-control-surface.md` in the K4D repo for the
+// architecture facts and empirical-findings log.
+// =====================================================================
+public enum Flux2ReferenceChannelMask: String, Sendable {
+    /// No masking — donor contributes via all 128 channels (default).
+    case all
+    /// Keep channels 0–63 only — donor contributes structure / layout.
+    /// Channels 64–127 are zeroed before pack. Target use: silhouette /
+    /// pose / shape donors where texture would muddy the binding.
+    case low
+    /// Keep channels 64–127 only — donor contributes texture / detail.
+    /// Channels 0–63 are zeroed before pack. Target use: style /
+    /// palette / texture donors where structure would imprint shape.
+    case high
+}
+// END K4D LOCAL PATCH — reference channel mask
+
 /// Result of image generation including the image and metadata
 public struct Flux2GenerationResult: Sendable {
     /// The generated image
@@ -170,6 +202,14 @@ public class Flux2Pipeline: @unchecked Sendable {
 
     /// Clear cache every N denoising steps (0 = disabled)
     public var clearCacheEveryNSteps: Int = 5
+
+    // K4D LOCAL PATCH — reference channel mask (2026-05-17).
+    // Applied in `encodeReferenceImages` between BatchNorm and pack.
+    // Default `.all` is a no-op so existing callers see no behavior change.
+    /// Channel mask applied to every reference's patchified latent
+    /// before pack. `.all` = no mask (default). See
+    /// `Flux2ReferenceChannelMask` for semantics.
+    public var referenceChannelMask: Flux2ReferenceChannelMask = .all
 
     /// Initialize pipeline
     /// - Parameters:
@@ -1894,6 +1934,33 @@ public class Flux2Pipeline: @unchecked Sendable {
                 runningVar: vae.batchNormRunningVar
             )
             eval(patchified)
+
+            // K4D LOCAL PATCH — reference channel mask (2026-05-17).
+            // patchified shape: [1, 128, H/16, W/16]. Channels 0-63 carry
+            // structure/layout; channels 64-127 carry texture/detail (per
+            // capitan01R's hook-tracing of Klein 9B). Zero one half if
+            // the user has requested structure-only or texture-only donor
+            // contribution. `.all` is the default no-op.
+            if referenceChannelMask != .all {
+                let h16 = patchified.shape[2]
+                let w16 = patchified.shape[3]
+                let zeros64 = MLXArray.zeros([1, 64, h16, w16], dtype: patchified.dtype)
+                switch referenceChannelMask {
+                case .all:
+                    break // already handled by outer guard
+                case .low:
+                    // Keep channels 0-63 (structure), zero out 64-127 (texture).
+                    let lowChans = patchified[0..., 0..<64, 0..., 0...]
+                    patchified = concatenated([lowChans, zeros64], axis: 1)
+                case .high:
+                    // Zero channels 0-63 (structure), keep 64-127 (texture).
+                    let highChans = patchified[0..., 64..<128, 0..., 0...]
+                    patchified = concatenated([zeros64, highChans], axis: 1)
+                }
+                eval(patchified)
+                Flux2Debug.log("  -> Channel mask applied: \(referenceChannelMask.rawValue) (ref \(index + 1))")
+            }
+            // END K4D LOCAL PATCH — reference channel mask
 
             // Pack to sequence: [1, 128, H/16, W/16] -> [1, seq_len, 128]
             let packedLatents = LatentUtils.packPatchifiedToSequence(patchified)

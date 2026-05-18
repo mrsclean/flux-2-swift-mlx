@@ -605,6 +605,18 @@ public class Flux2WeightLoader {
             Flux2Debug.log("  Weight \(key): shape=\(value.shape), dtype=\(value.dtype)")
         }
 
+        // SPIKE PATCH (M4 Pro / Klein 9B bf16): per-tensor eval on the
+        // SOURCE updates dict — mirrors the patched mergeLoRAWeights at
+        // line 837. Without this, the next downstream broad eval (in
+        // LoRATrainingHelper or Flux2Pipeline) schedules the full
+        // ~18 GB model's lazy graph into a single Metal command buffer
+        // and gets killed by the 5 s GPU watchdog. Flushing the graph
+        // one tensor at a time HERE prevents downstream callers from
+        // accidentally batching them.
+        for tensor in updates.values {
+            eval(tensor)
+        }
+
         Flux2Debug.log("Applied \(updates.count) weights to transformer (\(notFound) not found)")
     }
 
@@ -830,10 +842,23 @@ public class Flux2WeightLoader {
                 mergedCount += 1
             }
 
-            // Apply this batch and materialize to free intermediate arrays
+            // Apply this batch and materialize to free intermediate arrays.
+            //
+            // SPIKE PATCH (M4 Pro / Klein 9B bf16): eval EACH updated
+            // tensor in its own dispatch, one at a time. Even
+            // eval(Array(updates.values)) — the full per-block batch —
+            // still exceeds macOS's 5 s GPU command-buffer watchdog on
+            // M4 Pro because each block has ~7-8 layers, and MLX
+            // appears to schedule the disk-load (mmap'd safetensors)
+            // + matmul + add for all of them into a single command
+            // buffer. Per-tensor eval forces one command buffer per
+            // matmul+add, which fits comfortably under the watchdog
+            // at the cost of more dispatch overhead.
             if !updates.isEmpty {
                 _ = model.update(parameters: ModuleParameters.unflattened(updates))
-                eval(model.parameters())
+                for tensor in updates.values {
+                    eval(tensor)
+                }
             }
         }
 

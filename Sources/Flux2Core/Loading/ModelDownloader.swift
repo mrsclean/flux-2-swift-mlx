@@ -140,8 +140,12 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             let name = file.replacingOccurrences(of: ".safetensors", with: "")
             let parts = name.split(separator: "-")
 
+            // SPIKE PATCH: accept both `model-NNNNN-of-NNNNN` (HF transformers
+            // convention) and `diffusion_pytorch_model-NNNNN-of-NNNNN`
+            // (HF diffusers convention, used by BFL's official FLUX.2-klein-9B
+            // repo). Upstream as-is only matches the former.
             guard parts.count == 4,
-                  parts[0] == "model",
+                  (parts[0] == "model" || parts[0] == "diffusion_pytorch_model"),
                   parts[2] == "of",
                   let index = Int(parts[1]),
                   let total = Int(parts[3]) else {

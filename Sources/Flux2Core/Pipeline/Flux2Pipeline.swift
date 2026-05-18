@@ -13,6 +13,35 @@ import AppKit
 #endif
 
 /// Generation mode for Flux.2
+// =========================================================================
+// K4D LOCAL PATCH — strength-controlled img2img (2026-05-15)
+// =========================================================================
+// This file has additions for classical strength-controlled img2img
+// (init-image + denoising-strength, SD-Auto1111-style). Marked with the
+// banner comment "K4D LOCAL PATCH" everywhere it touches. Candidate for
+// an upstream PR back to Vincent's repo — see commit notes.
+//
+// Extended 2026-05-15 with `.strengthImageToImageWithRefs` — combines
+// VAE-encoded init (strength path) with concatenated Kontext refs
+// (I2I path). Self-contained handler, no impact on the existing
+// `.strengthImageToImage` (refs-empty) or `.imageToImage` paths.
+//
+// ROLLBACK:
+//   1. Delete the .strengthImageToImage and .strengthImageToImageWithRefs
+//      enum cases below.
+//   2. Delete the `case .strengthImageToImage` branches added to the
+//      `switch mode` in generate(mode:) and to the post-scheduler
+//      blend block.
+//   3. Delete the entire `case .strengthImageToImageWithRefs` handler
+//      block in `switch mode` (self-contained, returns directly).
+//   4. Revert the `strength: 1.0` line in the T2I scheduler call to its
+//      hardcoded form (currently `strength: effectiveStrength`).
+//   5. Delete the public `generateImageToImageWithStrength(...)` method
+//      at the bottom of this file.
+// All edits are additive; the existing T2I and I2I-kontext paths are
+// untouched in their behavior.
+// =========================================================================
+
 public enum Flux2GenerationMode: Sendable {
     /// Text-to-Image generation
     case textToImage
@@ -26,6 +55,32 @@ public enum Flux2GenerationMode: Sendable {
     /// Reference images provide visual context through transformer attention.
     /// The model always denoises from pure noise while attending to reference tokens.
     case imageToImage(images: [CGImage])
+
+    /// K4D LOCAL PATCH — classical strength-controlled img2img.
+    /// Start from a noised init latent (FlowMatch interpolation
+    /// `x_t = (1-σ)·init + σ·noise`) instead of pure noise, then
+    /// run only the tail of the denoise loop. `strength` ∈ (0, 1]:
+    ///   - 1.0 → starting σ = 1.0 → init contribution vanishes,
+    ///     equivalent to T2I behavior.
+    ///   - 0.7 → starting σ ≈ 0.7 → init contributes ~30% at start.
+    ///   - 0.5 → starting σ ≈ 0.5 → balanced init/noise mix.
+    ///   - 0.2 → starting σ ≈ 0.2 → mostly init, light denoising.
+    /// Klein is a 4-step distilled model; values ≥ 0.7 are
+    /// recommended. Values below ~0.5 may degrade quality because
+    /// the distilled checkpoint wasn't trained for partial
+    /// trajectories.
+    case strengthImageToImage(initImage: CGImage, strength: Float)
+
+    /// K4D LOCAL PATCH — classical strength-controlled img2img with
+    /// Kontext reference images concatenated as conditioning tokens.
+    /// Combines `.strengthImageToImage` (init+strength latent setup)
+    /// with `.imageToImage` (refs as transformer attention tokens) so
+    /// a user can pin an init image AND attach 1–3 style refs in one
+    /// render. Self-contained handler; does NOT run through the
+    /// common denoise loop. Non-KV-cache implementation (parallels
+    /// the standard I2I path, which also has both KV and non-KV
+    /// variants).
+    case strengthImageToImageWithRefs(initImage: CGImage, strength: Float, references: [CGImage])
 }
 
 /// Progress callback for generation (currentStep, totalSteps)
@@ -1007,6 +1062,38 @@ public class Flux2Pipeline: @unchecked Sendable {
             )
             Flux2Debug.log("Generated patchified latents: \(patchifiedLatents.shape)")
 
+        case .strengthImageToImage(let initImage, _):
+            // K4D LOCAL PATCH. VAE-encode the init image into the
+            // same patchified-normalized format the existing pure-
+            // noise T2I path produces — same shape, same
+            // BatchNorm normalization, same packing later — so the
+            // downstream denoise loop is unchanged. Noise mixing
+            // happens AFTER the scheduler is set up (we need the
+            // starting σ first); for now this is the CLEAN init in
+            // latent space.
+            guard let vae = vae else {
+                throw Flux2Error.modelNotLoaded("VAE")
+            }
+            let processed = preprocessImageForVAE(
+                initImage,
+                targetHeight: validHeight,
+                targetWidth: validWidth
+            )
+            // Deterministic mean encoding (samplePosterior=false) —
+            // mirrors what encodeReferenceImages does; gives a
+            // reproducible init latent rather than a noisy sample
+            // from the posterior.
+            let rawLatents = vae.encode(processed, samplePosterior: false)
+            var initPatchified = LatentUtils.packLatentsToPatchified(rawLatents)
+            initPatchified = LatentUtils.normalizeLatentsWithBatchNorm(
+                initPatchified,
+                runningMean: vae.batchNormRunningMean,
+                runningVar: vae.batchNormRunningVar
+            )
+            eval(initPatchified)
+            patchifiedLatents = initPatchified
+            Flux2Debug.log("Encoded init image to patchified latents: \(patchifiedLatents.shape)")
+
         case .imageToImage(let images):
             // === FLUX.2 IMAGE-TO-IMAGE MODE ===
             // Flux.2 uses CONDITIONING mode for all I2I:
@@ -1295,6 +1382,219 @@ public class Flux2Pipeline: @unchecked Sendable {
                 wasUpsampled: wasPromptUpsampled,
                 originalPrompt: prompt
             )
+
+        // ============================================================
+        // K4D LOCAL PATCH — strength img2img + Kontext refs handler
+        // ============================================================
+        // Self-contained, parallels the standard (non-KV) `.imageToImage`
+        // path above but starts from a VAE-encoded init image (with a
+        // FlowMatch noise blend at the strength's starting sigma)
+        // instead of pure noise. The denoise loop concatenates the
+        // refs onto the output latents at every step exactly like the
+        // standard I2I path, and slices the noise prediction back to
+        // the output portion before the scheduler step. Refs stay
+        // clean across all steps.
+        //
+        // ROLLBACK: delete this entire `case` block. The
+        // `.strengthImageToImageWithRefs` enum case can stay or be
+        // removed depending on whether the wrapper still references it.
+        case .strengthImageToImageWithRefs(let initImage, let strength, let refImages):
+            guard let vae = vae else {
+                throw Flux2Error.modelNotLoaded("VAE")
+            }
+
+            // ---- 1. VAE-encode init → patchified normalized latents ----
+            let processedInit = preprocessImageForVAE(
+                initImage,
+                targetHeight: validHeight,
+                targetWidth: validWidth
+            )
+            let rawInitLatents = vae.encode(processedInit, samplePosterior: false)
+            var initPatchified = LatentUtils.packLatentsToPatchified(rawInitLatents)
+            initPatchified = LatentUtils.normalizeLatentsWithBatchNorm(
+                initPatchified,
+                runningMean: vae.batchNormRunningMean,
+                runningVar: vae.batchNormRunningVar
+            )
+            eval(initPatchified)
+            Flux2Debug.log("[strength+refs] Encoded init to patchified: \(initPatchified.shape)")
+
+            // ---- 2. Encode all Kontext reference images ----
+            let (referenceLatents, referencePositionIds) = try encodeReferenceImages(
+                refImages,
+                height: validHeight,
+                width: validWidth
+            )
+            eval(referenceLatents)
+            Flux2Debug.log("[strength+refs] Encoded \(refImages.count) refs: latents \(referenceLatents.shape), posIds \(referencePositionIds.shape)")
+
+            // ---- 3. Compute the output sequence length (needed for
+            // the scheduler's mu calculation). The latents are still
+            // in patchified shape at this point so the noise blend
+            // happens in canonical [B, 128, H/16, W/16] layout —
+            // see the noise-layout comment below.
+            let h16 = validHeight / 16
+            let w16 = validWidth / 16
+            let outputSeqLen = h16 * w16
+
+            // ---- 4. Generate combined position IDs (output + refs) ----
+            let textLength = textEmbeddings.shape[1]
+            let (textIds, outputImageIds, _) = LatentUtils.combinePositionIDs(
+                textLength: textLength,
+                height: validHeight,
+                width: validWidth
+            )
+            let combinedImageIds = concatenated([outputImageIds, referencePositionIds], axis: 0)
+            Flux2Debug.log("[strength+refs] Combined image IDs: \(combinedImageIds.shape)")
+
+            // ---- 5. Setup scheduler with strength (partial trajectory) ----
+            if let customSigmas = loraSchedulerOverrides?.customSigmas {
+                scheduler.setCustomSigmas(customSigmas)
+            } else {
+                scheduler.setTimesteps(numInferenceSteps: steps, imageSeqLen: outputSeqLen, strength: strength)
+            }
+
+            // ---- 6. FlowMatch noise blend in PATCHIFIED shape, then pack ----
+            //   x_start = (1 - σ_start) * init + σ_start * noise
+            //
+            // CRITICAL BUG FIX 2026-05-17: this blend MUST happen in
+            // the canonical patchified shape [B, 128, H/16, W/16],
+            // not in the post-pack sequence shape [B, H/16*W/16, 128].
+            // MLX's `MLXRandom.normal(shape)` fills memory in C-order
+            // for whatever shape it's given — so generating noise as
+            // [1, 4096, 128] produces a DIFFERENT per-position value
+            // distribution than generating as [1, 128, 64, 64] and
+            // then packing. Klein's transformer treats the noise as
+            // a structured spatial latent, and the wrong per-position
+            // layout silently degrades attention to Kontext refs.
+            // The original broken version produced no donor influence;
+            // this version matches the standard I2I path's canonical
+            // noise layout and refs attend correctly.
+            //
+            // Refs are NEVER noise-blended; they remain clean
+            // conditioning across all denoise steps.
+            let startSigma = scheduler.sigmas[0]
+            let noisePatchified = MLXRandom.normal([1, 128, h16, w16])
+            eval(noisePatchified)
+            let blendedPatchified = MLXArray(1 - startSigma) * initPatchified + MLXArray(startSigma) * noisePatchified
+            eval(blendedPatchified)
+            var packedOutputLatents = LatentUtils.packPatchifiedToSequence(blendedPatchified)
+            eval(packedOutputLatents)
+            Flux2Debug.log("[strength+refs] Noise blend (patchified): σ_start=\(startSigma), strength=\(strength)")
+
+            let effectiveSteps = scheduler.sigmas.count - 1
+            Flux2Debug.log("[strength+refs] Starting denoising loop (\(effectiveSteps) steps)")
+            profiler.setTotalSteps(effectiveSteps)
+
+            // ---- 7. Denoise loop with refs concatenated each step ----
+            let guidanceTensorR: MLXArray? = model.usesGuidanceEmbeds ? MLXArray([guidance]) : nil
+            MemoryConfig.applyCacheLimit(bytes: phaseLimits.denoising)
+            profiler.start("6. Denoising Loop")
+
+            for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+                let stepStart = Date()
+                let sigma = scheduler.sigmas[stepIdx]
+                let tArr = MLXArray([sigma])
+
+                let inputLatents = concatenated([packedOutputLatents, referenceLatents], axis: 1)
+
+                guard let transformer = transformer else {
+                    throw Flux2Error.generationCancelled
+                }
+
+                let noisePred = transformer.callAsFunction(
+                    hiddenStates: inputLatents,
+                    encoderHiddenStates: textEmbeddings,
+                    timestep: tArr,
+                    guidance: guidanceTensorR,
+                    imgIds: combinedImageIds,
+                    txtIds: textIds
+                )
+
+                // Slice noise prediction to output portion only —
+                // refs are static conditioning, never get scheduled.
+                let outputNoisePred = noisePred[0..., 0..<outputSeqLen, 0...]
+
+                packedOutputLatents = scheduler.step(
+                    modelOutput: outputNoisePred,
+                    timestep: sigma,
+                    sample: packedOutputLatents
+                )
+                eval(packedOutputLatents)
+
+                if clearCacheEveryNSteps > 0 && (stepIdx + 1) % clearCacheEveryNSteps == 0 {
+                    MemoryConfig.clearCache()
+                }
+
+                let stepDuration = Date().timeIntervalSince(stepStart)
+                profiler.recordStep(duration: stepDuration)
+                onProgress?(stepIdx + 1, effectiveSteps)
+                Flux2Debug.verbose("[strength+refs] Step \(stepIdx + 1)/\(effectiveSteps)")
+
+                if let interval = checkpointInterval,
+                   let checkpointCallback = onCheckpoint,
+                   (stepIdx + 1) % interval == 0 {
+                    var checkpointPatchified = LatentUtils.unpackSequenceToPatchified(
+                        packedOutputLatents,
+                        height: validHeight,
+                        width: validWidth
+                    )
+                    checkpointPatchified = LatentUtils.denormalizeLatentsWithBatchNorm(
+                        checkpointPatchified,
+                        runningMean: vae.batchNormRunningMean,
+                        runningVar: vae.batchNormRunningVar
+                    )
+                    let checkpointLatents = LatentUtils.unpatchifyLatents(checkpointPatchified)
+                    eval(checkpointLatents)
+                    let checkpointDecoded = vae.decode(checkpointLatents)
+                    eval(checkpointDecoded)
+                    if let checkpointImage = postprocessVAEOutput(checkpointDecoded) {
+                        checkpointCallback(stepIdx + 1, checkpointImage)
+                    }
+                }
+
+                if stepIdx % 10 == 0 {
+                    memoryManager.clearCache()
+                }
+            }
+            profiler.end("6. Denoising Loop")
+
+            // ---- 8. Decode final output latents ----
+            profiler.start("7. VAE Decode")
+            var finalPatchifiedR = LatentUtils.unpackSequenceToPatchified(
+                packedOutputLatents,
+                height: validHeight,
+                width: validWidth
+            )
+            finalPatchifiedR = LatentUtils.denormalizeLatentsWithBatchNorm(
+                finalPatchifiedR,
+                runningMean: vae.batchNormRunningMean,
+                runningVar: vae.batchNormRunningVar
+            )
+            let finalLatentsR = LatentUtils.unpatchifyLatents(finalPatchifiedR)
+            eval(finalLatentsR)
+
+            let decodedR = vae.decode(finalLatentsR)
+            eval(decodedR)
+            profiler.end("7. VAE Decode")
+
+            profiler.start("8. Post-processing")
+            guard let imageR = postprocessVAEOutput(decodedR) else {
+                throw Flux2Error.generationFailed("Failed to convert VAE output to image")
+            }
+            profiler.end("8. Post-processing")
+
+            if profiler.isEnabled {
+                print(profiler.generateReport())
+            }
+
+            return Flux2GenerationResult(
+                image: imageR,
+                usedPrompt: finalUsedPrompt,
+                wasUpsampled: wasPromptUpsampled,
+                originalPrompt: prompt
+            )
+        // END K4D LOCAL PATCH — strength img2img + refs handler
         }
 
         // === TEXT-TO-IMAGE PATH (I2I returns earlier) ===
@@ -1315,12 +1615,40 @@ public class Flux2Pipeline: @unchecked Sendable {
         let imageSeqLen = packedLatents.shape[1]
         Flux2Debug.log("Image sequence length: \(imageSeqLen)")
 
-        // Setup scheduler (T2I always uses strength 1.0)
-        // Check for custom sigmas from LoRA (e.g., Turbo LoRAs)
+        // Setup scheduler.
+        //
+        // K4D LOCAL PATCH: extract strength from the mode so the
+        // .strengthImageToImage path can request a partial trajectory
+        // (e.g. strength=0.7 → start denoising from sigma≈0.7
+        // instead of 1.0, skipping the early-noise steps). For
+        // .textToImage and any future case, the default 1.0 keeps the
+        // pre-patch behavior bit-identical.
+        let effectiveStrength: Float = {
+            if case .strengthImageToImage(_, let s) = mode { return s }
+            return 1.0
+        }()
         if let customSigmas = loraSchedulerOverrides?.customSigmas {
             scheduler.setCustomSigmas(customSigmas)
         } else {
-            scheduler.setTimesteps(numInferenceSteps: steps, imageSeqLen: imageSeqLen, strength: 1.0)
+            scheduler.setTimesteps(numInferenceSteps: steps, imageSeqLen: imageSeqLen, strength: effectiveStrength)
+        }
+
+        // K4D LOCAL PATCH: FlowMatch noise injection for strength
+        // img2img. After the scheduler has resolved its (possibly
+        // truncated) sigma schedule, blend the CLEAN init latent
+        // with fresh noise at the starting sigma:
+        //
+        //     x_start = (1 - σ_start) * init + σ_start * noise
+        //
+        // This is the rectified-flow analog of SD's "noise at the
+        // strength's timestep." With strength=1.0, σ_start=1.0 and
+        // the formula reduces to pure noise — regression-safe.
+        if case .strengthImageToImage = mode {
+            let startSigma = scheduler.sigmas[0]
+            let noise = MLXRandom.normal(packedLatents.shape)
+            packedLatents = MLXArray(1 - startSigma) * packedLatents + MLXArray(startSigma) * noise
+            eval(packedLatents)
+            Flux2Debug.log("Strength-img2img noise blend: σ_start=\(startSigma), strength=\(effectiveStrength)")
         }
 
         let effectiveSteps = scheduler.sigmas.count - 1
@@ -1843,6 +2171,88 @@ extension Flux2Pipeline {
 
         return hasTransformer && hasVAE
     }
+
+    // =====================================================================
+    // K4D LOCAL PATCH — strength-controlled img2img public entry point
+    // (2026-05-15). Wraps `generate(mode: .strengthImageToImage(...))`
+    // with a docstring + signature familiar to callers of the existing
+    // `generateImageToImage` overloads. Delete this method to roll back.
+    // =====================================================================
+
+    /// Classical strength-controlled img2img — start from an init
+    /// image at the requested denoising strength and run only the
+    /// tail of the trajectory.
+    ///
+    /// Unlike `generateImageToImage(images:)` (which uses references
+    /// as transformer-attention CONTEXT while still starting from
+    /// pure noise), this method noises the init image's encoded
+    /// latent and skips part of the denoise loop — the SD/Auto1111
+    /// "denoising strength" pattern.
+    ///
+    /// Optionally accepts a non-empty `references` array (up to 3 for
+    /// Klein). When refs are provided, the call routes to the
+    /// `.strengthImageToImageWithRefs` mode which combines the
+    /// init-encode + noise-blend latent setup with the I2I-style
+    /// refs-as-attention-tokens conditioning — the user's init still
+    /// drives the composition, the refs still drive context.
+    ///
+    /// - Parameters:
+    ///   - prompt: Text prompt describing the desired output.
+    ///   - initImage: Init image whose latent seeds the trajectory.
+    ///   - strength: 0.0–1.0. Recommended 0.5–0.9 for Klein. 1.0
+    ///     equals pure T2I (init contribution is mathematically 0).
+    ///   - references: Optional Kontext refs (0–3). Default empty.
+    ///   - height/width: Output dimensions. Default → init dims.
+    ///   - steps: Denoising steps. Klein default 4.
+    ///   - guidance: Distilled-CFG embed. Klein default 1.0.
+    ///   - seed: Reproducible noise sample.
+    ///   - upsamplePrompt: Visual prompt enhancement (default off).
+    ///   - checkpointInterval: Save intermediate every N steps.
+    /// - Returns: Generated CGImage.
+    public func generateImageToImageWithStrength(
+        prompt: String,
+        initImage: CGImage,
+        strength: Float,
+        references: [CGImage] = [],
+        height: Int? = nil,
+        width: Int? = nil,
+        steps: Int = 4,
+        guidance: Float = 1.0,
+        seed: UInt64? = nil,
+        upsamplePrompt: Bool = false,
+        checkpointInterval: Int? = nil,
+        onProgress: Flux2ProgressCallback? = nil,
+        onCheckpoint: Flux2CheckpointCallback? = nil
+    ) async throws -> CGImage {
+        let targetHeight = height ?? initImage.height
+        let targetWidth = width ?? initImage.width
+
+        // Route to the correct mode: refs-empty → existing strength
+        // path (unchanged behavior, regression-safe); refs-present →
+        // the new strength+refs handler.
+        let mode: Flux2GenerationMode = references.isEmpty
+            ? .strengthImageToImage(initImage: initImage, strength: strength)
+            : .strengthImageToImageWithRefs(initImage: initImage, strength: strength, references: references)
+
+        return try await generate(
+            mode: mode,
+            prompt: prompt,
+            interpretImagePaths: nil,
+            height: targetHeight,
+            width: targetWidth,
+            steps: steps,
+            guidance: guidance,
+            seed: seed,
+            upsamplePrompt: upsamplePrompt,
+            checkpointInterval: checkpointInterval,
+            onProgress: onProgress,
+            onCheckpoint: onCheckpoint
+        )
+    }
+
+    // =====================================================================
+    // END K4D LOCAL PATCH
+    // =====================================================================
 
     /// List missing models
     public var missingModels: [ModelRegistry.ModelComponent] {

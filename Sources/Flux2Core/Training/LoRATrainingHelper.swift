@@ -435,8 +435,14 @@ extension LoRATrainingHelper {
         var weights = try Flux2WeightLoader.loadWeights(from: weightsPath)
         try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer)
 
-        // Force evaluation to materialize weights
-        eval(transformer.parameters())
+        // SPIKE PATCH (M4 Pro / Klein 9B bf16): per-tensor eval is
+        // already done inside applyTransformerWeights (see the
+        // patched eval loop in WeightLoader.swift around line 608).
+        // The original `eval(transformer.parameters())` here was the
+        // crashing call — it batched ~18 GB into a single Metal
+        // command buffer and tripped the 5 s watchdog on M4 Pro.
+        // Removed; the upstream guarantee that "weights are eval'd"
+        // is now provided by the patch in applyTransformerWeights.
 
         // Clear cache after loading
         MLX.Memory.clearCache()

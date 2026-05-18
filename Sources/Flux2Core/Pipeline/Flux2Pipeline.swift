@@ -121,6 +121,40 @@ public enum Flux2ReferenceChannelMask: String, Sendable {
 }
 // END K4D LOCAL PATCH — reference channel mask
 
+// =====================================================================
+// K4D LOCAL PATCH — reference spatial fade (2026-05-17)
+//
+// Phase 1.3 (revised) of the Klein attention-control surface work.
+// Per-position multiplier on the patchified ref latent, applied
+// pre-pack alongside the channel mask. Lets a donor's spatial
+// contribution be biased toward a region (center, edges, top, bottom,
+// left, right) rather than uniform across the canvas.
+//
+// Implementation: a 2D float multiplier of shape `[H/16, W/16]`
+// broadcast against the 128 channels. Each mode is a linear gradient
+// from 1.0 to FADE_FLOOR (currently 0.2, hardcoded — keeps donor
+// from going fully silent at the fade-out side).
+//
+// See `docs/klein-control-surface.md` for the lever catalog.
+// =====================================================================
+public enum Flux2ReferenceSpatialFade: String, Sendable {
+    /// No spatial fade (default, no-op).
+    case none
+    /// Donor's contribution falls off radially from the center.
+    /// Center keeps full strength; edges fade to FADE_FLOOR.
+    case centerOut = "center-out"
+    /// Donor's contribution falls off radially from the edges.
+    /// Edges keep full strength; center fades to FADE_FLOOR.
+    case edgesOut = "edges-out"
+    /// Donor's contribution decays from top to bottom of the latent.
+    /// Top row keeps full strength; bottom row fades to FADE_FLOOR.
+    case topDown = "top-down"
+    /// Donor's contribution decays from left to right of the latent.
+    /// Left column keeps full strength; right column fades to FADE_FLOOR.
+    case leftRight = "left-right"
+}
+// END K4D LOCAL PATCH — reference spatial fade
+
 /// Result of image generation including the image and metadata
 public struct Flux2GenerationResult: Sendable {
     /// The generated image
@@ -210,6 +244,14 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// before pack. `.all` = no mask (default). See
     /// `Flux2ReferenceChannelMask` for semantics.
     public var referenceChannelMask: Flux2ReferenceChannelMask = .all
+
+    // K4D LOCAL PATCH — reference spatial fade (2026-05-17).
+    // Applied in `encodeReferenceImages` after the channel mask,
+    // before pack. Default `.none` is a no-op.
+    /// Spatial-fade direction applied as a per-position multiplier
+    /// on every reference's patchified latent before pack. `.none`
+    /// disables the fade (default). See `Flux2ReferenceSpatialFade`.
+    public var referenceSpatialFade: Flux2ReferenceSpatialFade = .none
 
     /// Initialize pipeline
     /// - Parameters:
@@ -1961,6 +2003,66 @@ public class Flux2Pipeline: @unchecked Sendable {
                 Flux2Debug.log("  -> Channel mask applied: \(referenceChannelMask.rawValue) (ref \(index + 1))")
             }
             // END K4D LOCAL PATCH — reference channel mask
+
+            // K4D LOCAL PATCH — reference spatial fade (2026-05-17).
+            // Build a [H/16, W/16] multiplier mask matching the
+            // selected fade direction, broadcast to [1, 1, H/16, W/16],
+            // multiply against the patchified ref latent's 128 channels.
+            // FADE_FLOOR keeps the donor from going fully silent on the
+            // fade-out side (set to 0.2 — empirically a useful baseline).
+            if referenceSpatialFade != .none {
+                let h16 = patchified.shape[2]
+                let w16 = patchified.shape[3]
+                let fadeFloor: Float = 0.2
+
+                // Build a [H, W] float mask in [fadeFloor, 1.0].
+                let fadeMask: MLXArray
+                switch referenceSpatialFade {
+                case .none:
+                    // unreachable thanks to outer guard
+                    fadeMask = MLXArray.ones([h16, w16], dtype: .float32)
+                case .topDown:
+                    // Row 0 = 1.0, last row = fadeFloor; linear interp.
+                    let hIdx = MLXArray.arange(h16, dtype: .float32) // [H]
+                    let rowMul = MLXArray(1.0) - (hIdx / Float(max(h16 - 1, 1))) * Float(1.0 - fadeFloor)
+                    // rowMul shape [H] → broadcast to [H, W]
+                    fadeMask = MLX.broadcast(rowMul.expandedDimensions(axis: 1), to: [h16, w16])
+                case .leftRight:
+                    // Col 0 = 1.0, last col = fadeFloor; linear interp.
+                    let wIdx = MLXArray.arange(w16, dtype: .float32)
+                    let colMul = MLXArray(1.0) - (wIdx / Float(max(w16 - 1, 1))) * Float(1.0 - fadeFloor)
+                    fadeMask = MLX.broadcast(colMul.expandedDimensions(axis: 0), to: [h16, w16])
+                case .centerOut, .edgesOut:
+                    // Radial distance from center (h/2, w/2). Compute the
+                    // normalized Manhattan-style separable distance (sum of
+                    // row + col distances scaled to [0,1] each then averaged)
+                    // — keeps the math GPU-friendly without sqrt.
+                    let hIdx = MLXArray.arange(h16, dtype: .float32)
+                    let wIdx = MLXArray.arange(w16, dtype: .float32)
+                    let hCenter = Float(h16 - 1) / 2.0
+                    let wCenter = Float(w16 - 1) / 2.0
+                    let hDist = MLX.abs(hIdx - MLXArray(hCenter)) / Float(max(hCenter, 1))  // [H]
+                    let wDist = MLX.abs(wIdx - MLXArray(wCenter)) / Float(max(wCenter, 1))  // [W]
+                    let hExpanded = hDist.expandedDimensions(axis: 1)  // [H, 1]
+                    let wExpanded = wDist.expandedDimensions(axis: 0)  // [1, W]
+                    let distGrid = (MLX.broadcast(hExpanded, to: [h16, w16]) + MLX.broadcast(wExpanded, to: [h16, w16])) / Float(2.0)
+                    if referenceSpatialFade == .centerOut {
+                        // Center (dist=0) → 1.0; edges (dist→1.0) → fadeFloor
+                        fadeMask = MLXArray(1.0) - distGrid * Float(1.0 - fadeFloor)
+                    } else {
+                        // Center → fadeFloor; edges → 1.0
+                        fadeMask = MLXArray(fadeFloor) + distGrid * Float(1.0 - fadeFloor)
+                    }
+                }
+
+                // Broadcast to [1, 1, H, W] so it multiplies cleanly
+                // against the [1, 128, H, W] patchified tensor.
+                let mask4d = fadeMask.expandedDimensions(axes: [0, 1])  // [1, 1, H, W]
+                patchified = patchified * mask4d
+                eval(patchified)
+                Flux2Debug.log("  -> Spatial fade applied: \(referenceSpatialFade.rawValue) (ref \(index + 1))")
+            }
+            // END K4D LOCAL PATCH — reference spatial fade
 
             // Pack to sequence: [1, 128, H/16, W/16] -> [1, seq_len, 128]
             let packedLatents = LatentUtils.packPatchifiedToSequence(patchified)

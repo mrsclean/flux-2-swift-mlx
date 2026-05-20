@@ -126,7 +126,8 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         timestep: MLXArray,
         guidance: MLXArray? = nil,
         imgIds: MLXArray,
-        txtIds: MLXArray
+        txtIds: MLXArray,
+        refScaling: Flux2RefScalingContext? = nil   // K4D LOCAL PATCH (Phase D)
     ) -> MLXArray {
         Flux2Debug.verbose("=== Transformer Forward ===")
         Flux2Debug.verbose("hiddenStates: \(hiddenStates.shape)")
@@ -215,7 +216,8 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
                     temb: temb,
                     rotaryEmb: ropeEmb,
                     imgModParams: imgMod,
-                    txtModParams: txtMod
+                    txtModParams: txtMod,
+                    refScaling: refScaling  // K4D LOCAL PATCH (Phase D)
                 )
 
                 imgHS = newImg
@@ -289,13 +291,18 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
                 let out = checkpointedForward(inputs)
                 combinedHS = out[0]
             } else {
-                // Pass encoder_hidden_states=nil since everything is in combinedHS
+                // Pass encoder_hidden_states=nil since everything is in combinedHS.
+                // K4D LOCAL PATCH (Phase D): forward textSeqLen so the block can
+                // map refTokenStartInImage → combined-stream coordinates when
+                // applying the per-block ref-token scaling.
                 combinedHS = block(
                     hiddenStates: combinedHS,
                     encoderHiddenStates: nil,
                     temb: temb,
                     rotaryEmb: ropeEmb,
-                    modParams: singleMod
+                    modParams: singleMod,
+                    refScaling: refScaling,
+                    textTokenCount: textSeqLen
                 )
             }
 

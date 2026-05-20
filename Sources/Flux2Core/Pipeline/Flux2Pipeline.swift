@@ -155,6 +155,49 @@ public enum Flux2ReferenceSpatialFade: String, Sendable {
 }
 // END K4D LOCAL PATCH — reference spatial fade
 
+// =====================================================================
+// K4D LOCAL PATCH — per-block reference K/V strength (2026-05-20)
+//
+// Phase D of the Klein attention-control surface work. capitan01R's
+// hook-trace established that Klein-on-ComfyUI ships `attn1_patch`
+// that scales K and V at the ref-token slice inside every attention
+// block. We replicate the same per-block effect by scaling the
+// image-hidden-state `imgNorm` at ref-token positions BEFORE each
+// block's attention call. Because Klein's toQ/toK/toV are bias-free
+// linears, scaling input is mathematically equivalent to scaling K
+// and V post-projection. Q at ref positions is also scaled, but ref
+// outputs are discarded at extraction so the user-visible effect is
+// the same as capitan01R's K/V-only patch.
+//
+// Threaded as an optional parameter through Flux2Transformer2DModel
+// → Flux2TransformerBlock + Flux2SingleBlock → applied right before
+// the attention call. Default nil (or strength=1.0) is a perfect
+// no-op — no allocations, no MLX ops added to the graph.
+//
+// See `docs/klein-control-surface.md` for the full lever catalog +
+// empirical findings log.
+// =====================================================================
+public struct Flux2RefScalingContext: Sendable {
+    /// Index in the IMAGE stream where reference tokens begin.
+    /// Tokens `[0..<refTokenStartInImage]` are main_img output;
+    /// tokens `[refTokenStartInImage...]` are references. The
+    /// double-stream block uses this offset directly (image-only
+    /// stream). The single-stream block adds its text-prefix length
+    /// internally to find the ref slice in the combined stream.
+    public let refTokenStartInImage: Int
+    /// Multiplicative scalar applied to `imgNorm` at ref positions.
+    /// `1.0` = no-op. Useful range ~0.0..3.0. Klein at strength=0.0
+    /// effectively ignores refs; strength>1.0 amplifies ref pull
+    /// (often produces over-sharpening artifacts past ~1.5).
+    public let strength: Float
+
+    public init(refTokenStartInImage: Int, strength: Float) {
+        self.refTokenStartInImage = refTokenStartInImage
+        self.strength = strength
+    }
+}
+// END K4D LOCAL PATCH — per-block reference K/V strength
+
 /// Context passed to a denoising step hook.
 ///
 /// `sigmaNext == 0` on the final iteration — chains relying on RePaint-style
@@ -273,6 +316,20 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// before pack. `.all` = no mask (default). See
     /// `Flux2ReferenceChannelMask` for semantics.
     public var referenceChannelMask: Flux2ReferenceChannelMask = .all
+
+    // K4D LOCAL PATCH — per-block reference K/V strength (2026-05-20).
+    // Applied inside Flux2TransformerBlock + Flux2SingleBlock before
+    // each attention call, scaling imgNorm at ref-token positions.
+    // Default 1.0 is a perfect no-op (block skips the scaling op
+    // entirely when strength == 1.0). Useful range ~0.0..2.0.
+    /// Per-block multiplicative scalar applied to `imgNorm` at ref
+    /// positions before each block's attention forward. `1.0` = no-op
+    /// (default). Mathematically equivalent to scaling K and V at
+    /// ref positions because Klein's toQ/toK/toV are bias-free
+    /// linears. Replicates capitan01R's `attn1_patch` strength
+    /// behavior on the K4D-native path. See
+    /// `docs/klein-control-surface.md` for context.
+    public var referenceStrength: Float = 1.0
 
     // K4D LOCAL PATCH — reference spatial fade (2026-05-17).
     // Applied in `encodeReferenceImages` after the channel mask,
@@ -1473,6 +1530,14 @@ public class Flux2Pipeline: @unchecked Sendable {
                     throw Flux2Error.generationCancelled
                 }
 
+                // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
+                // Build the context once per step. outputSeqLen is the
+                // main_img token count (the ref tokens start right after).
+                // Skip when strength == 1.0 (no-op anyway).
+                let refStrengthCtx: Flux2RefScalingContext? = (referenceStrength != 1.0)
+                    ? Flux2RefScalingContext(refTokenStartInImage: outputSeqLen, strength: referenceStrength)
+                    : nil
+
                 // Run transformer (conditional pass)
                 let noisePredCond = transformer.callAsFunction(
                     hiddenStates: inputLatents,
@@ -1480,7 +1545,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                     timestep: t,
                     guidance: guidanceTensor,
                     imgIds: combinedImageIds,
-                    txtIds: textIds
+                    txtIds: textIds,
+                    refScaling: refStrengthCtx
                 )
 
                 // Classical CFG: second (unconditional) pass with the SAME image
@@ -1495,7 +1561,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                         timestep: t,
                         guidance: guidanceTensor,
                         imgIds: combinedImageIds,
-                        txtIds: uncondIds
+                        txtIds: uncondIds,
+                        refScaling: refStrengthCtx
                     )
                     noisePred = noisePredUncond + MLXArray(guidance) * (noisePredCond - noisePredUncond)
                 } else {
@@ -1730,13 +1797,19 @@ public class Flux2Pipeline: @unchecked Sendable {
                     throw Flux2Error.generationCancelled
                 }
 
+                // K4D LOCAL PATCH — per-block reference K/V strength (Phase D).
+                let refStrengthCtxR: Flux2RefScalingContext? = (referenceStrength != 1.0)
+                    ? Flux2RefScalingContext(refTokenStartInImage: outputSeqLen, strength: referenceStrength)
+                    : nil
+
                 let noisePred = transformer.callAsFunction(
                     hiddenStates: inputLatents,
                     encoderHiddenStates: textEmbeddings,
                     timestep: tArr,
                     guidance: guidanceTensorR,
                     imgIds: combinedImageIds,
-                    txtIds: textIds
+                    txtIds: textIds,
+                    refScaling: refStrengthCtxR
                 )
 
                 // Slice noise prediction to output portion only —

@@ -83,7 +83,8 @@ public class Flux2TransformerBlock: Module, @unchecked Sendable {
         temb: MLXArray,
         rotaryEmb: (cos: MLXArray, sin: MLXArray)? = nil,
         imgModParams: [ModulationParams]? = nil,
-        txtModParams: [ModulationParams]? = nil
+        txtModParams: [ModulationParams]? = nil,
+        refScaling: Flux2RefScalingContext? = nil  // K4D LOCAL PATCH (Phase D)
     ) -> (encoderHiddenStates: MLXArray, hiddenStates: MLXArray) {
         // Store residuals
         let residualImg = hiddenStates
@@ -104,6 +105,21 @@ public class Flux2TransformerBlock: Module, @unchecked Sendable {
         if let txtMod = txtModParams, txtMod.count >= 1 {
             txtNorm = applyModulation(txtNorm, shift: txtMod[0].shift, scale: txtMod[0].scale)
         }
+
+        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
+        // Scale `imgNorm` at ref-token positions BEFORE the attention call.
+        // imgNorm shape: [B, S_img, dim] where S_img = mainImgLen + refLen.
+        // Equivalent to scaling K and V at ref positions post-projection
+        // (toK/toV are bias-free linears). No-op when strength == 1.0 or no refs.
+        if let ctx = refScaling,
+           ctx.strength != 1.0,
+           ctx.refTokenStartInImage < imgNorm.shape[1] {
+            let sImg = imgNorm.shape[1]
+            let mainPart = imgNorm[0..., 0..<ctx.refTokenStartInImage, 0...]
+            let refPart  = imgNorm[0..., ctx.refTokenStartInImage..<sImg, 0...] * MLXArray(ctx.strength)
+            imgNorm = concatenated([mainPart, refPart], axis: 1)
+        }
+        // END K4D LOCAL PATCH
 
         // Joint attention
         let (imgAttnOut, txtAttnOut) = attn(

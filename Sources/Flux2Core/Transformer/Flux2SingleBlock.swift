@@ -61,19 +61,26 @@ public class Flux2SingleTransformerBlock: Module, @unchecked Sendable {
         encoderHiddenStates: MLXArray?,
         temb: MLXArray,
         rotaryEmb: (cos: MLXArray, sin: MLXArray)? = nil,
-        modParams: [ModulationParams]? = nil
+        modParams: [ModulationParams]? = nil,
+        refScaling: Flux2RefScalingContext? = nil,        // K4D LOCAL PATCH (Phase D)
+        textTokenCount: Int? = nil                        // K4D LOCAL PATCH (Phase D)
     ) -> MLXArray {
         let residual = hiddenStates
 
         // If encoder_hidden_states is nil, hidden_states is assumed to already contain
         // concatenated text+image (diffusers pattern for single-stream blocks)
         let combined: MLXArray
+        let textLen: Int
         if let encoderHS = encoderHiddenStates {
             // Old pattern: concatenate here
             combined = concatenated([encoderHS, hiddenStates], axis: 1)
+            textLen = encoderHS.shape[1]
         } else {
-            // New pattern: already concatenated
+            // New pattern: already concatenated. Caller MUST provide
+            // textTokenCount if they want ref scaling on this block;
+            // -1 means "skip ref scaling" (safe fallback).
             combined = hiddenStates
+            textLen = textTokenCount ?? -1
         }
 
         // Normalize
@@ -83,6 +90,25 @@ public class Flux2SingleTransformerBlock: Module, @unchecked Sendable {
         if let mod = modParams, !mod.isEmpty {
             normalized = applyModulation(normalized, shift: mod[0].shift, scale: mod[0].scale)
         }
+
+        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
+        // Single-stream `combined` is `[B, S_txt + S_img, dim]`. The ref-token
+        // boundary in image-stream coordinates (refTokenStartInImage) maps to
+        // combined-stream coordinates by adding textLen. Skipped when textLen
+        // is unknown (caller didn't supply textTokenCount for the
+        // already-concatenated path).
+        if let ctx = refScaling,
+           ctx.strength != 1.0,
+           textLen >= 0 {
+            let total = normalized.shape[1]
+            let refStartInCombined = textLen + ctx.refTokenStartInImage
+            if refStartInCombined < total {
+                let headPart = normalized[0..., 0..<refStartInCombined, 0...]
+                let refPart  = normalized[0..., refStartInCombined..<total, 0...] * MLXArray(ctx.strength)
+                normalized = concatenated([headPart, refPart], axis: 1)
+            }
+        }
+        // END K4D LOCAL PATCH
 
         // Parallel attention + FFN
         var output = attn(hiddenStates: normalized, rotaryEmb: rotaryEmb)

@@ -137,21 +137,77 @@ public enum Flux2ReferenceChannelMask: String, Sendable {
 //
 // See `docs/klein-control-surface.md` for the lever catalog.
 // =====================================================================
-public enum Flux2ReferenceSpatialFade: String, Sendable {
-    /// No spatial fade (default, no-op).
-    case none
-    /// Donor's contribution falls off radially from the center.
-    /// Center keeps full strength; edges fade to FADE_FLOOR.
-    case centerOut = "center-out"
-    /// Donor's contribution falls off radially from the edges.
-    /// Edges keep full strength; center fades to FADE_FLOOR.
-    case edgesOut = "edges-out"
-    /// Donor's contribution decays from top to bottom of the latent.
-    /// Top row keeps full strength; bottom row fades to FADE_FLOOR.
-    case topDown = "top-down"
-    /// Donor's contribution decays from left to right of the latent.
-    /// Left column keeps full strength; right column fades to FADE_FLOOR.
-    case leftRight = "left-right"
+/// Parametric spatial fade (Phase 2.3 generalization, 2026-05-20).
+///
+/// Replaces the original 5-enum modes (none / center-out / edges-out /
+/// top-down / left-right) with a continuous parameter space that
+/// describes them all and arbitrary intermediate cases. The original
+/// modes map cleanly to (shape + origin) combinations:
+///
+///   - `none` → `.off`
+///   - `center-out` → `.radial`, origin=(0.5, 0.5)
+///   - `top-down` → `.vertical`, origin=(_, 0.0)
+///   - `left-right` → `.horizontal`, origin=(0.0, _)
+///   - `edges-out` (inverse radial) is no longer expressible as a
+///     single shape — was dropped in the rewrite. Users who want
+///     "donor strong at edges" can place the origin off-canvas
+///     (radius > distance to canvas center) for similar effect.
+///
+/// **Math:** at each patchified position `(y, x)` in `[H/16, W/16]`:
+///   distance = (shape-dependent)
+///   normDist = min(distance / radius, 1.0)
+///   strength = 1.0 + (floor - 1.0) * normDist
+/// → 1.0 at origin, linear ramp to `floor` at `distance == radius`,
+///   clamped at `floor` beyond. All distances in canvas-normalized
+///   units `[0, 1]` so the same parameters work across canvas
+///   aspect ratios.
+public struct Flux2ReferenceSpatialFade: Sendable {
+    public enum Shape: String, Sendable {
+        /// No fade (default, no-op).
+        case off
+        /// Euclidean distance from origin. Concentric falloff.
+        case radial
+        /// |x - originX| only. Fade along the x-axis from the origin column.
+        case horizontal
+        /// |y - originY| only. Fade along the y-axis from the origin row.
+        case vertical
+    }
+
+    /// Which falloff geometry to use. `.off` skips the fade entirely.
+    public let shape: Shape
+    /// Origin x in canvas-normalized coordinates `[0.0, 1.0]`
+    /// (0.0 = left edge, 1.0 = right edge). Donor's contribution is
+    /// strongest at this column for `.radial` and `.horizontal`.
+    public let originX: Float
+    /// Origin y in canvas-normalized coordinates `[0.0, 1.0]`
+    /// (0.0 = top edge, 1.0 = bottom edge). Donor's contribution is
+    /// strongest at this row for `.radial` and `.vertical`.
+    public let originY: Float
+    /// Distance from origin (in canvas-normalized units) at which
+    /// the donor strength reaches `floor`. Smaller = tighter falloff.
+    /// `1.0` reaches `floor` at the far edge of a unit-square canvas.
+    /// Clamped to `[0.01, 2.0]`.
+    public let radius: Float
+    /// Donor strength at maximum distance. `1.0` = uniform (no-op);
+    /// `0.0` = donor fully zeroed at the far edge. Clamped to `[0, 1]`.
+    public let floor: Float
+
+    public init(
+        shape: Shape = .off,
+        originX: Float = 0.5,
+        originY: Float = 0.5,
+        radius: Float = 1.0,
+        floor: Float = 0.2
+    ) {
+        self.shape = shape
+        self.originX = max(0, min(1, originX))
+        self.originY = max(0, min(1, originY))
+        self.radius = max(0.01, min(2.0, radius))
+        self.floor = max(0, min(1, floor))
+    }
+
+    /// No-op spatial fade. Engine code short-circuits on `shape == .off`.
+    public static let off = Flux2ReferenceSpatialFade(shape: .off)
 }
 // END K4D LOCAL PATCH — reference spatial fade
 
@@ -336,8 +392,9 @@ public class Flux2Pipeline: @unchecked Sendable {
     // before pack. Default `.none` is a no-op.
     /// Spatial-fade direction applied as a per-position multiplier
     /// on every reference's patchified latent before pack. `.none`
-    /// disables the fade (default). See `Flux2ReferenceSpatialFade`.
-    public var referenceSpatialFade: Flux2ReferenceSpatialFade = .none
+    /// Parametric spatial fade (Phase 2.3, 2026-05-20). `.off` is a
+    /// perfect no-op (default). See `Flux2ReferenceSpatialFade`.
+    public var referenceSpatialFade: Flux2ReferenceSpatialFade = .off
 
     /// Initialize pipeline
     /// - Parameters:
@@ -2269,65 +2326,71 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
             // END K4D LOCAL PATCH — reference channel mask
 
-            // K4D LOCAL PATCH — reference spatial fade (2026-05-17).
-            // Build a [H/16, W/16] multiplier mask matching the
-            // selected fade direction, broadcast to [1, 1, H/16, W/16],
-            // multiply against the patchified ref latent's 128 channels.
-            // FADE_FLOOR keeps the donor from going fully silent on the
-            // fade-out side (set to 0.2 — empirically a useful baseline).
-            if referenceSpatialFade != .none {
+            // K4D LOCAL PATCH — parametric reference spatial fade (Phase 2.3, 2026-05-20).
+            // Build a [H/16, W/16] multiplier mask from the parametric
+            // (origin, shape, radius, floor) inputs and apply to the
+            // patchified ref latent's 128 channels via broadcast multiply.
+            //
+            // Math at each (y, x):
+            //   normY = (y + 0.5) / h16,  normX = (x + 0.5) / w16    (canvas-normalized)
+            //   distance = (shape-dependent — see switch below)
+            //   normDist = clamp(distance / radius, 0, 1)
+            //   strength = 1.0 + (floor - 1.0) * normDist
+            //     → 1.0 at origin; linearly to `floor` at `radius`; floor beyond
+            if referenceSpatialFade.shape != .off {
                 let h16 = patchified.shape[2]
                 let w16 = patchified.shape[3]
-                let fadeFloor: Float = 0.2
+                let originX = referenceSpatialFade.originX
+                let originY = referenceSpatialFade.originY
+                let radius  = referenceSpatialFade.radius
+                let floor   = referenceSpatialFade.floor
 
-                // Build a [H, W] float mask in [fadeFloor, 1.0].
-                let fadeMask: MLXArray
-                switch referenceSpatialFade {
-                case .none:
+                // Per-axis grid of canvas-normalized coordinates.
+                // Use pixel-center sampling (+0.5) so the multiplier at
+                // (originX, originY) reaches the documented 1.0 max
+                // at the row/col closest to the requested origin.
+                let hIdx = MLXArray.arange(h16, dtype: .float32)
+                let wIdx = MLXArray.arange(w16, dtype: .float32)
+                let normY = (hIdx + MLXArray(Float(0.5))) / Float(h16)  // [H]
+                let normX = (wIdx + MLXArray(Float(0.5))) / Float(w16)  // [W]
+
+                // Distance grid in canvas-normalized units.
+                let distance: MLXArray
+                switch referenceSpatialFade.shape {
+                case .off:
                     // unreachable thanks to outer guard
-                    fadeMask = MLXArray.ones([h16, w16], dtype: .float32)
-                case .topDown:
-                    // Row 0 = 1.0, last row = fadeFloor; linear interp.
-                    let hIdx = MLXArray.arange(h16, dtype: .float32) // [H]
-                    let rowMul = MLXArray(1.0) - (hIdx / Float(max(h16 - 1, 1))) * Float(1.0 - fadeFloor)
-                    // rowMul shape [H] → broadcast to [H, W]
-                    fadeMask = MLX.broadcast(rowMul.expandedDimensions(axis: 1), to: [h16, w16])
-                case .leftRight:
-                    // Col 0 = 1.0, last col = fadeFloor; linear interp.
-                    let wIdx = MLXArray.arange(w16, dtype: .float32)
-                    let colMul = MLXArray(1.0) - (wIdx / Float(max(w16 - 1, 1))) * Float(1.0 - fadeFloor)
-                    fadeMask = MLX.broadcast(colMul.expandedDimensions(axis: 0), to: [h16, w16])
-                case .centerOut, .edgesOut:
-                    // Radial distance from center (h/2, w/2). Compute the
-                    // normalized Manhattan-style separable distance (sum of
-                    // row + col distances scaled to [0,1] each then averaged)
-                    // — keeps the math GPU-friendly without sqrt.
-                    let hIdx = MLXArray.arange(h16, dtype: .float32)
-                    let wIdx = MLXArray.arange(w16, dtype: .float32)
-                    let hCenter = Float(h16 - 1) / 2.0
-                    let wCenter = Float(w16 - 1) / 2.0
-                    let hDist = MLX.abs(hIdx - MLXArray(hCenter)) / Float(max(hCenter, 1))  // [H]
-                    let wDist = MLX.abs(wIdx - MLXArray(wCenter)) / Float(max(wCenter, 1))  // [W]
-                    let hExpanded = hDist.expandedDimensions(axis: 1)  // [H, 1]
-                    let wExpanded = wDist.expandedDimensions(axis: 0)  // [1, W]
-                    let distGrid = (MLX.broadcast(hExpanded, to: [h16, w16]) + MLX.broadcast(wExpanded, to: [h16, w16])) / Float(2.0)
-                    if referenceSpatialFade == .centerOut {
-                        // Center (dist=0) → 1.0; edges (dist→1.0) → fadeFloor
-                        fadeMask = MLXArray(1.0) - distGrid * Float(1.0 - fadeFloor)
-                    } else {
-                        // Center → fadeFloor; edges → 1.0
-                        fadeMask = MLXArray(fadeFloor) + distGrid * Float(1.0 - fadeFloor)
-                    }
+                    distance = MLXArray.zeros([h16, w16], dtype: .float32)
+                case .horizontal:
+                    // Only x-component of distance.
+                    let dx = MLX.abs(normX - MLXArray(originX))                       // [W]
+                    distance = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
+                case .vertical:
+                    // Only y-component.
+                    let dy = MLX.abs(normY - MLXArray(originY))                       // [H]
+                    distance = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
+                case .radial:
+                    // Euclidean distance from origin.
+                    let dy = normY - MLXArray(originY)                                 // [H]
+                    let dx = normX - MLXArray(originX)                                 // [W]
+                    let dyB = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
+                    let dxB = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
+                    distance = MLX.sqrt(dyB * dyB + dxB * dxB)
                 }
 
-                // Broadcast to [1, 1, H, W] so it multiplies cleanly
-                // against the [1, 128, H, W] patchified tensor.
-                let mask4d = fadeMask.expandedDimensions(axes: [0, 1])  // [1, 1, H, W]
+                // Clamp distance/radius to [0, 1] then linearly ramp to floor.
+                let normDist = MLX.minimum(distance / Float(radius), MLXArray(Float(1.0)))
+                let multiplier = MLXArray(Float(1.0)) + normDist * Float(floor - 1.0)  // [H, W]
+
+                // Broadcast to [1, 1, H, W] for channel-broadcast multiply.
+                let mask4d = multiplier.expandedDimensions(axes: [0, 1])
                 patchified = patchified * mask4d
                 eval(patchified)
-                Flux2Debug.log("  -> Spatial fade applied: \(referenceSpatialFade.rawValue) (ref \(index + 1))")
+                Flux2Debug.log(
+                    "  -> Spatial fade applied: shape=\(referenceSpatialFade.shape.rawValue) " +
+                    "origin=(\(originX),\(originY)) radius=\(radius) floor=\(floor) (ref \(index + 1))"
+                )
             }
-            // END K4D LOCAL PATCH — reference spatial fade
+            // END K4D LOCAL PATCH — parametric reference spatial fade
 
             // Pack to sequence: [1, 128, H/16, W/16] -> [1, seq_len, 128]
             let packedLatents = LatentUtils.packPatchifiedToSequence(patchified)

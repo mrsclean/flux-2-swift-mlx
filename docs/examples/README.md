@@ -48,6 +48,26 @@ For detailed comparison, see [**Model Comparison**](comparison.md).
   - Prompt upsampling progression
   - Performance comparison with Klein 4B
 
+### Chains (`Flux2Chains` library)
+
+End-to-end recipes that compose `Flux2Pipeline` with extra stages
+(masking, canvas extension, I2I conditioning, …). Every chain conforms to
+the `Flux2Chain` protocol and exposes a single `run() async throws`
+entry point.
+
+- **[Masked Inpainting](inpainting/README.md)** — `Flux2MaskedInpaintingChain`
+  - RePaint-style per-step latent blending; no Fill checkpoint required
+  - Hard vs soft mask comparison
+- **[Outpainting](outpainting/README.md)** — `Flux2OutpaintingChain`
+  - BFL-style API: image + per-side paddings + prompt
+  - Horizontal panoramic + vertical/square examples
+  - Full diagnostic trail of the recipe (4 failing variants → 1 working)
+
+A third chain, `Flux2Sharp3DRepairChain` (single-image 3D novel-view
+repair via Apple SHARP + a FLUX.2 LoRA), lives in the sibling repo
+[`rephoto-swift-coreml`](https://github.com/VincentGourbin/rephoto-swift-coreml)
+because it pulls in AMLR-licensed CoreML weights and MetalSplatter.
+
 ### Comparisons
 
 - **[Model Comparison](comparison.md)**

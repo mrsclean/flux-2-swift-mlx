@@ -8,6 +8,7 @@ let package = Package(
         // Libraries
         .library(name: "FluxTextEncoders", targets: ["FluxTextEncoders"]),
         .library(name: "Flux2Core", targets: ["Flux2Core"]),
+        .library(name: "Flux2Chains", targets: ["Flux2Chains"]),
         // CLI Tools
         .executable(name: "FluxEncodersCLI", targets: ["FluxEncodersCLI"]),
         .executable(name: "Flux2CLI", targets: ["Flux2CLI"]),
@@ -47,6 +48,14 @@ let package = Package(
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
             ]
         ),
+        .target(
+            name: "Flux2Chains",
+            dependencies: [
+                "Flux2Core",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
+        ),
         // MARK: - CLI Tools
         .executableTarget(
             name: "FluxEncodersCLI",
@@ -76,6 +85,10 @@ let package = Package(
         .testTarget(
             name: "Flux2CoreTests",
             dependencies: ["Flux2Core"]
+        ),
+        .testTarget(
+            name: "Flux2ChainsTests",
+            dependencies: ["Flux2Chains", "Flux2Core"]
         ),
     ]
 )

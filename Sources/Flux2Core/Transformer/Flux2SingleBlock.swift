@@ -91,20 +91,30 @@ public class Flux2SingleTransformerBlock: Module, @unchecked Sendable {
             normalized = applyModulation(normalized, shift: mod[0].shift, scale: mod[0].scale)
         }
 
-        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
-        // Single-stream `combined` is `[B, S_txt + S_img, dim]`. The ref-token
-        // boundary in image-stream coordinates (refTokenStartInImage) maps to
-        // combined-stream coordinates by adding textLen. Skipped when textLen
-        // is unknown (caller didn't supply textTokenCount for the
-        // already-concatenated path).
+        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D)
+        // + spatial fade (Phase E, 2026-05-21).
+        // Single-stream `combined` is `[B, S_txt + S_img, dim]`. The
+        // ref-token boundary in image-stream coordinates
+        // (refTokenStartInImage) maps to combined-stream coordinates by
+        // adding textLen. Skipped when textLen is unknown (caller
+        // didn't supply textTokenCount). Phase D scalar strength and
+        // Phase E per-token spatial multiplier compose multiplicatively.
         if let ctx = refScaling,
-           ctx.strength != 1.0,
+           ctx.isActive,
            textLen >= 0 {
             let total = normalized.shape[1]
             let refStartInCombined = textLen + ctx.refTokenStartInImage
             if refStartInCombined < total {
+                let refLen = total - refStartInCombined
                 let headPart = normalized[0..., 0..<refStartInCombined, 0...]
-                let refPart  = normalized[0..., refStartInCombined..<total, 0...] * MLXArray(ctx.strength)
+                var refPart  = normalized[0..., refStartInCombined..<total, 0...]
+                if ctx.strength != 1.0 {
+                    refPart = refPart * MLXArray(ctx.strength)
+                }
+                if let mult = ctx.perTokenMultiplier, mult.shape[0] == refLen {
+                    let mult3d = mult.reshaped([1, refLen, 1]).asType(refPart.dtype)
+                    refPart = refPart * mult3d
+                }
                 normalized = concatenated([headPart, refPart], axis: 1)
             }
         }

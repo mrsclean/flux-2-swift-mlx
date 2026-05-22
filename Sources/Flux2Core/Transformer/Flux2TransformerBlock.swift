@@ -106,17 +106,31 @@ public class Flux2TransformerBlock: Module, @unchecked Sendable {
             txtNorm = applyModulation(txtNorm, shift: txtMod[0].shift, scale: txtMod[0].scale)
         }
 
-        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
-        // Scale `imgNorm` at ref-token positions BEFORE the attention call.
-        // imgNorm shape: [B, S_img, dim] where S_img = mainImgLen + refLen.
-        // Equivalent to scaling K and V at ref positions post-projection
-        // (toK/toV are bias-free linears). No-op when strength == 1.0 or no refs.
+        // K4D LOCAL PATCH — per-block reference K/V strength (Phase D)
+        // + spatial fade (Phase E, 2026-05-21).
+        // Scale `imgNorm` at ref-token positions BEFORE the attention
+        // call. imgNorm shape: [B, S_img, dim], S_img = mainImgLen +
+        // refLen. Scaling imgNorm at ref positions is equivalent to
+        // scaling K and V there post-projection (toK/toV are bias-free
+        // linears). Two scales compose multiplicatively:
+        //   - Phase D: uniform scalar `strength` across all ref tokens
+        //   - Phase E: per-token `perTokenMultiplier` (the spatial fade)
+        // No-op when the context isn't active.
         if let ctx = refScaling,
-           ctx.strength != 1.0,
+           ctx.isActive,
            ctx.refTokenStartInImage < imgNorm.shape[1] {
             let sImg = imgNorm.shape[1]
+            let refLen = sImg - ctx.refTokenStartInImage
             let mainPart = imgNorm[0..., 0..<ctx.refTokenStartInImage, 0...]
-            let refPart  = imgNorm[0..., ctx.refTokenStartInImage..<sImg, 0...] * MLXArray(ctx.strength)
+            var refPart  = imgNorm[0..., ctx.refTokenStartInImage..<sImg, 0...]
+            if ctx.strength != 1.0 {
+                refPart = refPart * MLXArray(ctx.strength)
+            }
+            if let mult = ctx.perTokenMultiplier, mult.shape[0] == refLen {
+                // [refLen] -> [1, refLen, 1] broadcast across batch + dim.
+                let mult3d = mult.reshaped([1, refLen, 1]).asType(refPart.dtype)
+                refPart = refPart * mult3d
+            }
             imgNorm = concatenated([mainPart, refPart], axis: 1)
         }
         // END K4D LOCAL PATCH

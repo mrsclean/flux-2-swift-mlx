@@ -153,14 +153,19 @@ public enum Flux2ReferenceChannelMask: String, Sendable {
 ///     "donor strong at edges" can place the origin off-canvas
 ///     (radius > distance to canvas center) for similar effect.
 ///
-/// **Math:** at each patchified position `(y, x)` in `[H/16, W/16]`:
+/// **Math (hard core + feather band, 2026-05-21):** at each
+/// patchified position `(y, x)` in `[H/16, W/16]`:
 ///   distance = (shape-dependent)
-///   normDist = min(distance / radius, 1.0)
-///   strength = 1.0 + (floor - 1.0) * normDist
-/// → 1.0 at origin, linear ramp to `floor` at `distance == radius`,
-///   clamped at `floor` beyond. All distances in canvas-normalized
-///   units `[0, 1]` so the same parameters work across canvas
-///   aspect ratios.
+///   t = clamp((distance - radius) / max(feather, ε), 0, 1)
+///   strength = 1.0 + t · (floor - 1.0)
+/// → donor at FULL strength (1.0) everywhere inside `radius` (the
+///   flat core), then a linear ramp 1.0 → `floor` across the
+///   `feather`-wide band, then clamped at `floor` beyond
+///   `radius + feather`. `feather == 0` collapses to a crisp hard
+///   step at `radius`. Replaced the earlier ramp-from-origin (no flat
+///   core — donor was full-strength only at the exact origin point).
+///   All distances in canvas-normalized units `[0, 1]` so the same
+///   parameters work across canvas aspect ratios.
 public struct Flux2ReferenceSpatialFade: Sendable {
     public enum Shape: String, Sendable {
         /// No fade (default, no-op).
@@ -183,13 +188,18 @@ public struct Flux2ReferenceSpatialFade: Sendable {
     /// (0.0 = top edge, 1.0 = bottom edge). Donor's contribution is
     /// strongest at this row for `.radial` and `.vertical`.
     public let originY: Float
-    /// Distance from origin (in canvas-normalized units) at which
-    /// the donor strength reaches `floor`. Smaller = tighter falloff.
-    /// `1.0` reaches `floor` at the far edge of a unit-square canvas.
+    /// Radius of the flat full-strength CORE (canvas-normalized
+    /// units). Inside this distance the donor is at strength 1.0.
     /// Clamped to `[0.01, 2.0]`.
     public let radius: Float
-    /// Donor strength at maximum distance. `1.0` = uniform (no-op);
-    /// `0.0` = donor fully zeroed at the far edge. Clamped to `[0, 1]`.
+    /// Width of the feather band just OUTSIDE the core (canvas-
+    /// normalized units). Across this band the donor strength ramps
+    /// linearly from 1.0 (at `radius`) to `floor` (at
+    /// `radius + feather`). `0.0` = crisp hard edge at `radius`.
+    /// Clamped to `[0, 2.0]`.
+    public let feather: Float
+    /// Donor strength beyond `radius + feather`. `1.0` = uniform
+    /// (no-op); `0.0` = donor fully zeroed outside. Clamped `[0, 1]`.
     public let floor: Float
 
     public init(
@@ -197,12 +207,14 @@ public struct Flux2ReferenceSpatialFade: Sendable {
         originX: Float = 0.5,
         originY: Float = 0.5,
         radius: Float = 1.0,
+        feather: Float = 0.0,
         floor: Float = 0.2
     ) {
         self.shape = shape
         self.originX = max(0, min(1, originX))
         self.originY = max(0, min(1, originY))
         self.radius = max(0.01, min(2.0, radius))
+        self.feather = max(0, min(2.0, feather))
         self.floor = max(0, min(1, floor))
     }
 
@@ -233,7 +245,13 @@ public struct Flux2ReferenceSpatialFade: Sendable {
 // See `docs/klein-control-surface.md` for the full lever catalog +
 // empirical findings log.
 // =====================================================================
-public struct Flux2RefScalingContext: Sendable {
+// `@unchecked Sendable` (was `Sendable`): the Phase E
+// `perTokenMultiplier` field is an `MLXArray`, which isn't Sendable.
+// It's an immutable `let`, computed once during reference encoding
+// and only ever READ (never mutated) on the denoising path — safe to
+// share across the actor hops the pipeline makes. Same treatment the
+// rest of the pipeline gives its MLXArray state.
+public struct Flux2RefScalingContext: @unchecked Sendable {
     /// Index in the IMAGE stream where reference tokens begin.
     /// Tokens `[0..<refTokenStartInImage]` are main_img output;
     /// tokens `[refTokenStartInImage...]` are references. The
@@ -247,9 +265,35 @@ public struct Flux2RefScalingContext: Sendable {
     /// (often produces over-sharpening artifacts past ~1.5).
     public let strength: Float
 
-    public init(refTokenStartInImage: Int, strength: Float) {
+    /// K4D LOCAL PATCH — Phase E (2026-05-21): per-ref-token spatial
+    /// multiplier. When non-nil, every ref token's `imgNorm` is scaled
+    /// by `strength × perTokenMultiplier[i]`. Length MUST equal the
+    /// total ref-token count (sum of every reference's H/16 × W/16).
+    /// Row-major order, matching `packPatchifiedToSequence`.
+    ///
+    /// This REPLACES the old Phase 2.3 spatial fade, which multiplied
+    /// the donor's raw patchified latent before the transformer —
+    /// that zeroed the latent itself (out-of-distribution input) and
+    /// produced corrupted K/V that the model couldn't reconstruct.
+    /// Scaling `imgNorm` per-block instead means the muted positions
+    /// contribute exactly-zero K/V (clean) while the residual stream
+    /// stays intact. Same mechanism as `strength`, just position-aware.
+    public let perTokenMultiplier: MLXArray?
+
+    public init(
+        refTokenStartInImage: Int,
+        strength: Float,
+        perTokenMultiplier: MLXArray? = nil
+    ) {
         self.refTokenStartInImage = refTokenStartInImage
         self.strength = strength
+        self.perTokenMultiplier = perTokenMultiplier
+    }
+
+    /// True when this context actually changes anything — either the
+    /// scalar strength is off-default OR a spatial multiplier is set.
+    public var isActive: Bool {
+        strength != 1.0 || perTokenMultiplier != nil
     }
 }
 // END K4D LOCAL PATCH — per-block reference K/V strength
@@ -395,6 +439,33 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Parametric spatial fade (Phase 2.3, 2026-05-20). `.off` is a
     /// perfect no-op (default). See `Flux2ReferenceSpatialFade`.
     public var referenceSpatialFade: Flux2ReferenceSpatialFade = .off
+
+    // K4D LOCAL PATCH — canvas/donor separation (2026-05-22).
+    //
+    // THE CORE FACT THIS FIXES: the engine has no native concept of
+    // "canvas" vs "donor". It receives one ordered, undifferentiated
+    // list of reference images. The canvas/donor split is a K4D
+    // app-layer idea (the UI's `slotKind`). The three reference
+    // controls above — channelMask, strength, spatialFade — are all
+    // DONOR controls in the UI, but were originally applied across
+    // *every* reference token because "exclude the canvas" plumbing
+    // was never built. With a canvas + donor render that silently
+    // scaled the canvas (reference #0) by the donor-strength slider,
+    // so the slider could never bias toward the donor. See
+    // `docs/klein-control-surface.md` → "Canvas vs donor".
+    //
+    // This field is that missing plumbing: the count of LEADING
+    // references that are canvases (the rendering target), which the
+    // controls must leave untouched. K4D sets it from the first
+    // reference's `slotKind`. 0 = every reference is a donor (donors-
+    // only render, or the engine called directly with no canvas) —
+    // controls apply to all. 1 = reference #0 is the canvas — controls
+    // skip it. The engine clamps defensively to [0, images.count].
+    /// Number of leading references that are canvases (rendering
+    /// targets), excluded from ALL donor controls (channel mask,
+    /// strength, spatial fade). Default 0 = treat every reference as
+    /// a donor (no-op vs. pre-2026-05-22 behavior).
+    public var canvasReferenceCount: Int = 0
 
     /// Initialize pipeline
     /// - Parameters:
@@ -1378,7 +1449,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("Generated output noise latents: \(patchifiedLatents.shape)")
 
             // Encode ALL reference images
-            let (referenceLatents, referencePositionIds) = try encodeReferenceImages(
+            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try encodeReferenceImages(
                 images,
                 height: validHeight,
                 width: validWidth
@@ -1487,6 +1558,11 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                 // Steps 1+: Cached denoising (no reference tokens in input)
                 for stepIdx in 1..<(scheduler.sigmas.count - 1) {
+                    // K4D LOCAL PATCH — cooperative cancellation (2026-05-21).
+                    // Lets a calling Task abort the render between steps.
+                    // Throws CancellationError if the task was cancelled.
+                    try Task.checkCancellation()
+
                     let stepStart = Date()
                     let sigma = scheduler.sigmas[stepIdx]
                     let t = MLXArray([sigma])
@@ -1574,6 +1650,9 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
 
             for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+                // K4D LOCAL PATCH — cooperative cancellation (2026-05-21).
+                try Task.checkCancellation()
+
                 let stepStart = Date()
 
                 let sigma = scheduler.sigmas[stepIdx]
@@ -1587,13 +1666,25 @@ public class Flux2Pipeline: @unchecked Sendable {
                     throw Flux2Error.generationCancelled
                 }
 
-                // K4D LOCAL PATCH — per-block reference K/V strength (Phase D, 2026-05-20).
-                // Build the context once per step. outputSeqLen is the
-                // main_img token count (the ref tokens start right after).
-                // Skip when strength == 1.0 (no-op anyway).
-                let refStrengthCtx: Flux2RefScalingContext? = (referenceStrength != 1.0)
-                    ? Flux2RefScalingContext(refTokenStartInImage: outputSeqLen, strength: referenceStrength)
-                    : nil
+                // K4D LOCAL PATCH — donor controls (Phase D strength +
+                // Phase E spatial fade, unified 2026-05-22). Build the
+                // context once per step. outputSeqLen is the main_img
+                // token count (ref tokens start right after).
+                //
+                // The scalar `strength` is now ALWAYS 1.0: strength,
+                // spatial fade, AND the canvas/donor exclusion are all
+                // folded into `refTokenMultiplier` by
+                // `encodeReferenceImages`. The context's scalar path is
+                // kept identity-only so `perTokenMultiplier` is the
+                // single source of truth. `isActive` is true whenever
+                // that multiplier is present.
+                let refStrengthCtxCandidate = Flux2RefScalingContext(
+                    refTokenStartInImage: outputSeqLen,
+                    strength: 1.0,
+                    perTokenMultiplier: refTokenMultiplier
+                )
+                let refStrengthCtx: Flux2RefScalingContext? =
+                    refStrengthCtxCandidate.isActive ? refStrengthCtxCandidate : nil
 
                 // Run transformer (conditional pass)
                 let noisePredCond = transformer.callAsFunction(
@@ -1772,7 +1863,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("[strength+refs] Encoded init to patchified: \(initPatchified.shape)")
 
             // ---- 2. Encode all Kontext reference images ----
-            let (referenceLatents, referencePositionIds) = try encodeReferenceImages(
+            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try encodeReferenceImages(
                 refImages,
                 height: validHeight,
                 width: validWidth
@@ -1844,6 +1935,9 @@ public class Flux2Pipeline: @unchecked Sendable {
             profiler.start("6. Denoising Loop")
 
             for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+                // K4D LOCAL PATCH — cooperative cancellation (2026-05-21).
+                try Task.checkCancellation()
+
                 let stepStart = Date()
                 let sigma = scheduler.sigmas[stepIdx]
                 let tArr = MLXArray([sigma])
@@ -1854,10 +1948,18 @@ public class Flux2Pipeline: @unchecked Sendable {
                     throw Flux2Error.generationCancelled
                 }
 
-                // K4D LOCAL PATCH — per-block reference K/V strength (Phase D).
-                let refStrengthCtxR: Flux2RefScalingContext? = (referenceStrength != 1.0)
-                    ? Flux2RefScalingContext(refTokenStartInImage: outputSeqLen, strength: referenceStrength)
-                    : nil
+                // K4D LOCAL PATCH — donor controls (Phase D strength +
+                // Phase E spatial fade, unified 2026-05-22). Scalar
+                // `strength` is always 1.0 — strength, spatial fade,
+                // and the canvas/donor exclusion are all folded into
+                // `refTokenMultiplier` by `encodeReferenceImages`.
+                let refStrengthCtxRCandidate = Flux2RefScalingContext(
+                    refTokenStartInImage: outputSeqLen,
+                    strength: 1.0,
+                    perTokenMultiplier: refTokenMultiplier
+                )
+                let refStrengthCtxR: Flux2RefScalingContext? =
+                    refStrengthCtxRCandidate.isActive ? refStrengthCtxRCandidate : nil
 
                 let noisePred = transformer.callAsFunction(
                     hiddenStates: inputLatents,
@@ -2033,6 +2135,9 @@ public class Flux2Pipeline: @unchecked Sendable {
 
         // Denoising loop - use sigmas (in [0, 1] range) for transformer
         for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+            // K4D LOCAL PATCH — cooperative cancellation (2026-05-21).
+            try Task.checkCancellation()
+
             let stepStart = Date()
 
             let sigma = scheduler.sigmas[stepIdx]
@@ -2230,12 +2335,18 @@ public class Flux2Pipeline: @unchecked Sendable {
     ///   - images: Reference images (1-10 supported)
     ///   - height: Target output height
     ///   - width: Target output width
-    /// - Returns: Tuple of (latents [1, seq_len, 128], position IDs [seq_len, 4])
+    /// - Returns: Tuple of (latents [1, seq_len, 128], position IDs
+    ///   [seq_len, 4], refTokenMultiplier [total_ref_tokens] or nil).
+    ///   `refTokenMultiplier` is the unified donor-control scale —
+    ///   per ref token, `strength × spatialFade` for donor refs and
+    ///   `1.0` for canvas refs (the leading `canvasReferenceCount`).
+    ///   nil when no donor control is engaged (strength == 1.0 AND
+    ///   spatial fade off).
     private func encodeReferenceImages(
         _ images: [CGImage],
         height: Int,
         width: Int
-    ) throws -> (latents: MLXArray, positionIds: MLXArray) {
+    ) throws -> (latents: MLXArray, positionIds: MLXArray, refTokenMultiplier: MLXArray?) {
         guard let vae = vae else {
             throw Flux2Error.modelNotLoaded("VAE")
         }
@@ -2244,7 +2355,18 @@ public class Flux2Pipeline: @unchecked Sendable {
             throw Flux2Error.invalidConfiguration("No reference images provided")
         }
 
-        Flux2Debug.log("Encoding \(images.count) reference images separately with unique T-coordinates...")
+        // K4D LOCAL PATCH — canvas/donor separation (2026-05-22).
+        // The first `clampedCanvasCount` references are canvases — the
+        // rendering target — and must be EXCLUDED from every donor
+        // control (channel mask, strength, spatial fade). Everything
+        // at index >= clampedCanvasCount is a donor. Clamped so a
+        // bad count from the caller can't index past the array.
+        let clampedCanvasCount = max(0, min(canvasReferenceCount, images.count))
+        Flux2Debug.log(
+            "Encoding \(images.count) reference images " +
+            "(\(clampedCanvasCount) canvas, \(images.count - clampedCanvasCount) donor) " +
+            "with unique T-coordinates..."
+        )
 
         // === STEP 1: Process each image separately ===
         // Max area per image - matches diffusers pipeline_flux2.py line 892-893
@@ -2255,8 +2377,28 @@ public class Flux2Pipeline: @unchecked Sendable {
         var allPackedLatents: [MLXArray] = []
         var latentHeights: [Int] = []
         var latentWidths: [Int] = []
+        // K4D LOCAL PATCH — donor control multiplier (2026-05-22).
+        // Per-ref-token multiplier folding TWO donor controls into one
+        // per-token vector: the global `referenceStrength` scalar
+        // (Phase D) and the per-position spatial fade (Phase E). One
+        // [seqLen] array per ref, concatenated after the loop into the
+        // combined [total_ref_tokens] vector. Canvas refs always get
+        // identity (1.0) — that is the canvas/donor separation. Empty
+        // when neither control is engaged (strength == 1.0 AND fade
+        // off) so the default path stays a perfect no-op.
+        var controlMultipliers: [MLXArray] = []
+        // Whether ANY donor control needs a multiplier this render.
+        // Global (not per-ref) — depends only on the pipeline knobs —
+        // so either every ref gets a multiplier entry or none do, and
+        // the concatenated vector always covers the full ref-token
+        // block (or is empty).
+        let needsControlMultiplier =
+            (referenceStrength != 1.0) || (referenceSpatialFade.shape != .off)
 
         for (index, image) in images.enumerated() {
+            // Canvas refs (the leading `clampedCanvasCount`) are the
+            // rendering target — donor controls skip them entirely.
+            let isDonorRef = index >= clampedCanvasCount
             Flux2Debug.log("Processing reference image \(index + 1)/\(images.count): \(image.width)x\(image.height)")
 
             // Calculate target dimensions for this image
@@ -2299,13 +2441,15 @@ public class Flux2Pipeline: @unchecked Sendable {
             )
             eval(patchified)
 
-            // K4D LOCAL PATCH — reference channel mask (2026-05-17).
+            // K4D LOCAL PATCH — reference channel mask (2026-05-17;
+            // canvas/donor gate added 2026-05-22).
             // patchified shape: [1, 128, H/16, W/16]. Channels 0-63 carry
             // structure/layout; channels 64-127 carry texture/detail (per
             // capitan01R's hook-tracing of Klein 9B). Zero one half if
             // the user has requested structure-only or texture-only donor
-            // contribution. `.all` is the default no-op.
-            if referenceChannelMask != .all {
+            // contribution. `.all` is the default no-op. Skipped on
+            // canvas refs — channel masking is a DONOR control.
+            if referenceChannelMask != .all && isDonorRef {
                 let h16 = patchified.shape[2]
                 let w16 = patchified.shape[3]
                 let zeros64 = MLXArray.zeros([1, 64, h16, w16], dtype: patchified.dtype)
@@ -2326,71 +2470,112 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
             // END K4D LOCAL PATCH — reference channel mask
 
-            // K4D LOCAL PATCH — parametric reference spatial fade (Phase 2.3, 2026-05-20).
-            // Build a [H/16, W/16] multiplier mask from the parametric
-            // (origin, shape, radius, floor) inputs and apply to the
-            // patchified ref latent's 128 channels via broadcast multiply.
+            // K4D LOCAL PATCH — donor control multiplier
+            // (Phase D strength + Phase E spatial fade, unified +
+            // canvas/donor separation 2026-05-22).
             //
-            // Math at each (y, x):
-            //   normY = (y + 0.5) / h16,  normX = (x + 0.5) / w16    (canvas-normalized)
-            //   distance = (shape-dependent — see switch below)
-            //   normDist = clamp(distance / radius, 0, 1)
-            //   strength = 1.0 + (floor - 1.0) * normDist
-            //     → 1.0 at origin; linearly to `floor` at `radius`; floor beyond
-            if referenceSpatialFade.shape != .off {
+            // Build this reference's per-token multiplier and append
+            // it to `controlMultipliers`. Two donor controls fold in:
+            //
+            //   • referenceStrength — global scalar (Phase D). Was
+            //     previously a separate `Flux2RefScalingContext.strength`
+            //     applied across ALL ref tokens — including the canvas.
+            //     Folded here so the canvas can be excluded.
+            //   • spatial fade — per-position (Phase E). Built from the
+            //     parametric (origin, shape, radius, feather, floor)
+            //     inputs as a [H/16, W/16] mask.
+            //
+            // CANVAS REFS GET IDENTITY (1.0). That is the whole point
+            // of this patch: the canvas is the rendering TARGET, not a
+            // donor, so neither strength nor fade may touch it. Before
+            // 2026-05-22 the controls hit every reference, so a
+            // canvas+donor render silently scaled the canvas by the
+            // "Donor strength" slider and the slider could never bias
+            // toward the donor.
+            //
+            // The multiplier is handed to the attention blocks via
+            // `Flux2RefScalingContext.perTokenMultiplier`, which scales
+            // `imgNorm` at ref positions per-block. NOT applied to the
+            // patchified latent here — multiplying the raw latent feeds
+            // the transformer an out-of-distribution (partially-zeroed)
+            // donor and corrupts K/V (the pre-Phase-E bug).
+            //
+            // Fade math at each (y, x), unchanged from Phase E:
+            //   normY = (y + 0.5) / h16,  normX = (x + 0.5) / w16
+            //   distance = (shape-dependent)
+            //   t = clamp((distance - radius) / max(feather, ε), 0, 1)
+            //   fade = 1.0 + t·(floor - 1.0)
+            //     → 1.0 inside `radius`; ramps to `floor` across the
+            //       `feather` band; `floor` beyond.
+            if needsControlMultiplier {
                 let h16 = patchified.shape[2]
                 let w16 = patchified.shape[3]
-                let originX = referenceSpatialFade.originX
-                let originY = referenceSpatialFade.originY
-                let radius  = referenceSpatialFade.radius
-                let floor   = referenceSpatialFade.floor
+                let tokenCount = h16 * w16
 
-                // Per-axis grid of canvas-normalized coordinates.
-                // Use pixel-center sampling (+0.5) so the multiplier at
-                // (originX, originY) reaches the documented 1.0 max
-                // at the row/col closest to the requested origin.
-                let hIdx = MLXArray.arange(h16, dtype: .float32)
-                let wIdx = MLXArray.arange(w16, dtype: .float32)
-                let normY = (hIdx + MLXArray(Float(0.5))) / Float(h16)  // [H]
-                let normX = (wIdx + MLXArray(Float(0.5))) / Float(w16)  // [W]
+                if !isDonorRef {
+                    // Canvas reference — excluded from donor controls.
+                    let identity = MLXArray.ones([tokenCount])
+                    eval(identity)
+                    controlMultipliers.append(identity)
+                    Flux2Debug.log("  -> Control multiplier: canvas ref \(index + 1) → identity (1.0)")
+                } else {
+                    // Donor reference — strength × spatial fade.
+                    let fadeFlat: MLXArray
+                    if referenceSpatialFade.shape != .off {
+                        let originX = referenceSpatialFade.originX
+                        let originY = referenceSpatialFade.originY
+                        let radius  = referenceSpatialFade.radius
+                        let floor   = referenceSpatialFade.floor
 
-                // Distance grid in canvas-normalized units.
-                let distance: MLXArray
-                switch referenceSpatialFade.shape {
-                case .off:
-                    // unreachable thanks to outer guard
-                    distance = MLXArray.zeros([h16, w16], dtype: .float32)
-                case .horizontal:
-                    // Only x-component of distance.
-                    let dx = MLX.abs(normX - MLXArray(originX))                       // [W]
-                    distance = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
-                case .vertical:
-                    // Only y-component.
-                    let dy = MLX.abs(normY - MLXArray(originY))                       // [H]
-                    distance = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
-                case .radial:
-                    // Euclidean distance from origin.
-                    let dy = normY - MLXArray(originY)                                 // [H]
-                    let dx = normX - MLXArray(originX)                                 // [W]
-                    let dyB = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
-                    let dxB = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
-                    distance = MLX.sqrt(dyB * dyB + dxB * dxB)
+                        let hIdx = MLXArray.arange(h16, dtype: .float32)
+                        let wIdx = MLXArray.arange(w16, dtype: .float32)
+                        let normY = (hIdx + MLXArray(Float(0.5))) / Float(h16)  // [H]
+                        let normX = (wIdx + MLXArray(Float(0.5))) / Float(w16)  // [W]
+
+                        let distance: MLXArray
+                        switch referenceSpatialFade.shape {
+                        case .off:
+                            distance = MLXArray.zeros([h16, w16], dtype: .float32)
+                        case .horizontal:
+                            let dx = MLX.abs(normX - MLXArray(originX))                       // [W]
+                            distance = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
+                        case .vertical:
+                            let dy = MLX.abs(normY - MLXArray(originY))                       // [H]
+                            distance = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
+                        case .radial:
+                            let dy = normY - MLXArray(originY)                                 // [H]
+                            let dx = normX - MLXArray(originX)                                 // [W]
+                            let dyB = MLX.broadcast(dy.expandedDimensions(axis: 1), to: [h16, w16])
+                            let dxB = MLX.broadcast(dx.expandedDimensions(axis: 0), to: [h16, w16])
+                            distance = MLX.sqrt(dyB * dyB + dxB * dxB)
+                        }
+
+                        let feather = referenceSpatialFade.feather
+                        let featherSafe = Float(max(feather, 1e-4))  // avoid /0
+                        let tRaw = (distance - MLXArray(Float(radius))) / featherSafe
+                        let t = MLX.minimum(
+                            MLX.maximum(tRaw, MLXArray(Float(0.0))),
+                            MLXArray(Float(1.0))
+                        )
+                        let fade = MLXArray(Float(1.0)) + t * Float(floor - 1.0)  // [H, W]
+                        // Flatten row-major to [H*W] — same token order
+                        // as packPatchifiedToSequence ([B,C,H,W] →
+                        // [B,H,W,C] → [B,H*W,C]).
+                        fadeFlat = fade.reshaped([tokenCount])
+                    } else {
+                        fadeFlat = MLXArray.ones([tokenCount])
+                    }
+                    // Fold the global strength scalar in.
+                    let donorMult = fadeFlat * Float(referenceStrength)
+                    eval(donorMult)
+                    controlMultipliers.append(donorMult)
+                    Flux2Debug.log(
+                        "  -> Control multiplier: donor ref \(index + 1) → " +
+                        "strength=\(referenceStrength) fade=\(referenceSpatialFade.shape.rawValue)"
+                    )
                 }
-
-                // Clamp distance/radius to [0, 1] then linearly ramp to floor.
-                let normDist = MLX.minimum(distance / Float(radius), MLXArray(Float(1.0)))
-                let multiplier = MLXArray(Float(1.0)) + normDist * Float(floor - 1.0)  // [H, W]
-
-                // Broadcast to [1, 1, H, W] for channel-broadcast multiply.
-                let mask4d = multiplier.expandedDimensions(axes: [0, 1])
-                patchified = patchified * mask4d
-                eval(patchified)
-                Flux2Debug.log(
-                    "  -> Spatial fade applied: shape=\(referenceSpatialFade.shape.rawValue) " +
-                    "origin=(\(originX),\(originY)) radius=\(radius) floor=\(floor) (ref \(index + 1))"
-                )
             }
-            // END K4D LOCAL PATCH — parametric reference spatial fade
+            // END K4D LOCAL PATCH — donor control multiplier
 
             // Pack to sequence: [1, 128, H/16, W/16] -> [1, seq_len, 128]
             let packedLatents = LatentUtils.packPatchifiedToSequence(patchified)
@@ -2429,7 +2614,42 @@ public class Flux2Pipeline: @unchecked Sendable {
         Flux2Debug.log("Position IDs generated: \(positionIds.shape)")
         Flux2Debug.log("Reference encoding complete: \(images.count) images with unique T-coordinates")
 
-        return (latents: finalLatents, positionIds: positionIds)
+        // K4D LOCAL PATCH — donor control multiplier (2026-05-22).
+        // Concatenate the per-ref control multipliers into the
+        // combined [total_ref_tokens] vector. The order matches
+        // `allPackedLatents` concatenation (ref 0's tokens, then ref
+        // 1's, ...) so token i of the multiplier lines up with token
+        // i of the reference latent block. Canvas refs contributed an
+        // all-1.0 segment; donor refs contributed strength × fade.
+        // nil when no control was engaged (strength == 1.0 AND fade
+        // off) — the default no-op path.
+        let refTokenMultiplier: MLXArray?
+        if controlMultipliers.isEmpty {
+            refTokenMultiplier = nil
+        } else {
+            let combined = concatenated(controlMultipliers, axis: 0)
+            eval(combined)
+            // Sanity: combined length must equal total ref tokens.
+            // Every ref appended exactly one segment when
+            // `needsControlMultiplier`, so this should always hold;
+            // the guard turns a layout drift into a safe no-op
+            // instead of a crash or a misaligned scale.
+            if combined.shape[0] != totalSeqLen {
+                Flux2Debug.log(
+                    "WARNING: ref-token multiplier length \(combined.shape[0]) " +
+                    "!= ref token count \(totalSeqLen) — disabling donor controls for this render"
+                )
+                refTokenMultiplier = nil
+            } else {
+                refTokenMultiplier = combined
+            }
+        }
+
+        return (
+            latents: finalLatents,
+            positionIds: positionIds,
+            refTokenMultiplier: refTokenMultiplier
+        )
     }
 
     /// Create CGImage from raw image data (PNG/JPEG) using CGImageSource for pixel-exact decoding.

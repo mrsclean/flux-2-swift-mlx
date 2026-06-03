@@ -251,6 +251,34 @@ public struct Flux2ReferenceSpatialFade: Sendable {
 // and only ever READ (never mutated) on the denoising path — safe to
 // share across the actor hops the pipeline makes. Same treatment the
 // rest of the pipeline gives its MLXArray state.
+/// K4D LOCAL PATCH — per-block donor-scope probe (2026-05-22).
+/// Restricts WHICH transformer blocks the donor K/V scaling applies
+/// in. A temporary experiment knob: does block-by-block variation of
+/// donor influence produce meaningfully different output on Klein's
+/// same-resolution transformer? (The U-Net "early = layout, late =
+/// texture" intuition may not transfer to a transformer where all 32
+/// blocks run at one resolution.) Driven by the `K4D_REF_BLOCK_SCOPE`
+/// environment variable; default `.all`. Delete this probe once the
+/// conjecture is settled.
+public enum Flux2RefBlockScope: Sendable, Equatable {
+    /// Donor scaling applies in every block (normal behavior).
+    case all
+    /// Donor scaling applies in the 8 double-stream blocks only.
+    case doubleOnly
+    /// Donor scaling applies in the 24 single-stream blocks only.
+    case singleOnly
+
+    /// Reads `K4D_REF_BLOCK_SCOPE` — `double` → `.doubleOnly`,
+    /// `single` → `.singleOnly`, anything else (incl. unset) → `.all`.
+    public static func fromEnvironment() -> Flux2RefBlockScope {
+        switch ProcessInfo.processInfo.environment["K4D_REF_BLOCK_SCOPE"]?.lowercased() {
+        case "double", "doubleonly", "double-only": return .doubleOnly
+        case "single", "singleonly", "single-only": return .singleOnly
+        default:                                    return .all
+        }
+    }
+}
+
 public struct Flux2RefScalingContext: @unchecked Sendable {
     /// Index in the IMAGE stream where reference tokens begin.
     /// Tokens `[0..<refTokenStartInImage]` are main_img output;
@@ -280,14 +308,21 @@ public struct Flux2RefScalingContext: @unchecked Sendable {
     /// stays intact. Same mechanism as `strength`, just position-aware.
     public let perTokenMultiplier: MLXArray?
 
+    /// K4D LOCAL PATCH — per-block donor-scope probe (2026-05-22).
+    /// Which transformer blocks this scaling applies in. `.all` =
+    /// every block (normal). See `Flux2RefBlockScope`.
+    public let blockScope: Flux2RefBlockScope
+
     public init(
         refTokenStartInImage: Int,
         strength: Float,
-        perTokenMultiplier: MLXArray? = nil
+        perTokenMultiplier: MLXArray? = nil,
+        blockScope: Flux2RefBlockScope = .all
     ) {
         self.refTokenStartInImage = refTokenStartInImage
         self.strength = strength
         self.perTokenMultiplier = perTokenMultiplier
+        self.blockScope = blockScope
     }
 
     /// True when this context actually changes anything — either the
@@ -1681,7 +1716,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                 let refStrengthCtxCandidate = Flux2RefScalingContext(
                     refTokenStartInImage: outputSeqLen,
                     strength: 1.0,
-                    perTokenMultiplier: refTokenMultiplier
+                    perTokenMultiplier: refTokenMultiplier,
+                    blockScope: Flux2RefBlockScope.fromEnvironment()
                 )
                 let refStrengthCtx: Flux2RefScalingContext? =
                     refStrengthCtxCandidate.isActive ? refStrengthCtxCandidate : nil
@@ -1956,7 +1992,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                 let refStrengthCtxRCandidate = Flux2RefScalingContext(
                     refTokenStartInImage: outputSeqLen,
                     strength: 1.0,
-                    perTokenMultiplier: refTokenMultiplier
+                    perTokenMultiplier: refTokenMultiplier,
+                    blockScope: Flux2RefBlockScope.fromEnvironment()
                 )
                 let refStrengthCtxR: Flux2RefScalingContext? =
                     refStrengthCtxRCandidate.isActive ? refStrengthCtxRCandidate : nil

@@ -166,6 +166,11 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         let imgModFlat = imgMod.flatMap { [$0.shift, $0.scale, $0.gate] }
         let txtModFlat = txtMod.flatMap { [$0.shift, $0.scale, $0.gate] }
 
+        // K4D LOCAL PATCH — per-block donor-scope probe (2026-05-22).
+        // `.singleOnly` suppresses donor scaling in the double-stream
+        // blocks; `.all` / `.doubleOnly` keep it.
+        let doubleRefScaling = (refScaling?.blockScope == .singleOnly) ? nil : refScaling
+
         for (blockIdx, block) in transformerBlocks.enumerated() {
             Flux2Debug.verbose("Double-stream block \(blockIdx)")
 
@@ -217,7 +222,7 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
                     rotaryEmb: ropeEmb,
                     imgModParams: imgMod,
                     txtModParams: txtMod,
-                    refScaling: refScaling  // K4D LOCAL PATCH (Phase D)
+                    refScaling: doubleRefScaling  // K4D LOCAL PATCH (Phase D + block-scope probe)
                 )
 
                 imgHS = newImg
@@ -257,6 +262,11 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         // OPTIMIZATION: Compute single-stream modulation ONCE before the loop
         let singleMod = singleStreamModulation(temb)
         let singleModFlat = singleMod.flatMap { [$0.shift, $0.scale, $0.gate] }
+
+        // K4D LOCAL PATCH — per-block donor-scope probe (2026-05-22).
+        // `.doubleOnly` suppresses donor scaling in the single-stream
+        // blocks; `.all` / `.singleOnly` keep it.
+        let singleRefScaling = (refScaling?.blockScope == .doubleOnly) ? nil : refScaling
 
         for (blockIdx, block) in singleTransformerBlocks.enumerated() {
             if gradientCheckpointing {
@@ -301,7 +311,7 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
                     temb: temb,
                     rotaryEmb: ropeEmb,
                     modParams: singleMod,
-                    refScaling: refScaling,
+                    refScaling: singleRefScaling,
                     textTokenCount: textSeqLen
                 )
             }

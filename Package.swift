@@ -52,6 +52,7 @@ let package = Package(
             name: "Flux2Chains",
             dependencies: [
                 "Flux2Core",
+                "FluxTextEncoders",  // Qwen3.5 VLM service for opt-in prompt enrichment
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ]
@@ -68,6 +69,7 @@ let package = Package(
             name: "Flux2CLI",
             dependencies: [
                 "Flux2Core",
+                "Flux2Chains",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Yams", package: "Yams"),
             ]

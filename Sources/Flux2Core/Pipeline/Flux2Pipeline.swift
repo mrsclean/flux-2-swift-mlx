@@ -411,6 +411,16 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Klein text encoder (Qwen3 - for Klein 4B/9B)
     private var kleinEncoder: KleinTextEncoder?
 
+    /// Optional override for the Klein text encoder (Qwen3) directory.
+    /// When non-nil, `loadTextEncoder()` loads weights + tokenizer from
+    /// this path instead of resolving and downloading the curated Qwen3
+    /// variant. Lets hosting apps swap in alternate Qwen3 builds
+    /// (abliterated, fine-tuned, different quantisation, …) without
+    /// forking the package. See `docs/TextEncoders.md` for the expected
+    /// directory layout and dimension constraints. Has no effect when
+    /// `model == .dev` (which uses the Mistral encoder).
+    private let kleinEncoderPath: URL?
+
     /// Diffusion transformer
     private var transformer: Flux2Transformer2DModel?
 
@@ -502,23 +512,28 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// a donor (no-op vs. pre-2026-05-22 behavior).
     public var canvasReferenceCount: Int = 0
 
-    /// Initialize pipeline
-    /// - Parameters:
-    ///   - model: Model variant to use (default: .dev)
-    ///   - quantization: Quantization settings for each component
-    ///   - hfToken: HuggingFace token for gated models
     /// Initialize the Flux.2 pipeline
     /// - Parameters:
     ///   - model: Model variant (dev, klein-4b, klein-9b)
     ///   - quantization: Quantization configuration
     ///   - memoryOptimization: Memory optimization settings (nil = auto-detect based on system RAM)
+    ///   - vaeVariant: VAE decoder variant (standard or small-decoder)
     ///   - hfToken: HuggingFace token for model downloads
+    ///   - kleinEncoderPath: Optional local directory containing a Qwen3
+    ///     text encoder (`config.json`, `tokenizer.json`, `*.safetensors`).
+    ///     When set, the Klein text encoder loads from this path instead
+    ///     of resolving and downloading the curated Qwen3 variant. The
+    ///     architecture must match the target Klein variant (Qwen3-4B for
+    ///     Klein 4B, Qwen3-8B for Klein 9B). See `docs/TextEncoders.md`
+    ///     for the directory layout and a list of compatible builds. Has
+    ///     no effect when `model == .dev` (which uses the Mistral encoder).
     public init(
         model: Flux2Model = .dev,
         quantization: Flux2QuantizationConfig = .balanced,
         memoryOptimization: MemoryOptimizationConfig? = nil,
         vaeVariant: ModelRegistry.VAEVariant = .smallDecoder,
-        hfToken: String? = nil
+        hfToken: String? = nil,
+        kleinEncoderPath: URL? = nil
     ) {
         self.model = model
         self.quantization = quantization
@@ -528,6 +543,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         )
         self.scheduler = FlowMatchEulerScheduler()
         self.downloader = hfToken != nil ? Flux2ModelDownloader(hfToken: hfToken) : Flux2ModelDownloader()
+        self.kleinEncoderPath = kleinEncoderPath
     }
 
     // MARK: - Model Loading
@@ -545,8 +561,39 @@ public class Flux2Pipeline: @unchecked Sendable {
         _ image: CGImage,
         targetHeight: Int,
         targetWidth: Int
-    ) -> MLXArray {
-        preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
+    ) async -> MLXArray {
+        await preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
+    }
+
+    /// Run a synchronous CPU block on a Default-QoS Dispatch worker,
+    /// regardless of the calling task's QoS.
+    ///
+    /// CoreGraphics rasterisation calls (`CGContext.draw(_:in:)` with
+    /// `interpolationQuality = .high`) dispatch their internal workers at
+    /// `.default` QoS. Calling them from a cooperative thread that
+    /// inherits a higher QoS (e.g. User-Initiated via MainActor button
+    /// click → `await chain.run()`) triggers the runtime priority-inversion
+    /// warning *"Thread running at User-initiated quality-of-service class
+    /// waiting on a lower QoS thread"* even though the work is correct
+    /// and the system silently elevates the worker via priority
+    /// inheritance.
+    ///
+    /// The fix has two pieces:
+    /// 1. `withCheckedContinuation` makes the cooperative thread *suspend*
+    ///    instead of *block* — no blocking thread means no inversion check.
+    /// 2. `DispatchWorkItem(qos: .default, flags: [.enforceQoS])` prevents
+    ///    Dispatch from elevating the worker's QoS to match the caller,
+    ///    so CG sees a Default-QoS caller and its internal workers stay at
+    ///    Default — symmetric, no inversion at the CG level either.
+    static func runAtDefaultQoS<T: Sendable>(
+        _ body: @Sendable @escaping () -> T
+    ) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            let workItem = DispatchWorkItem(qos: .default, flags: [.enforceQoS]) {
+                continuation.resume(returning: body())
+            }
+            DispatchQueue.global(qos: .default).async(execute: workItem)
+        }
     }
 
     /// Load all required models
@@ -614,11 +661,11 @@ public class Flux2Pipeline: @unchecked Sendable {
 
         case .klein4B, .klein4BBase:
             kleinEncoder = KleinTextEncoder(variant: .klein4B, quantization: mistralQuant)
-            try await kleinEncoder!.load()
+            try await kleinEncoder!.load(from: kleinEncoderPath)
 
         case .klein9B, .klein9BBase, .klein9BKV:
             kleinEncoder = KleinTextEncoder(variant: .klein9B, quantization: mistralQuant)
-            try await kleinEncoder!.load()
+            try await kleinEncoder!.load(from: kleinEncoderPath)
         }
 
         memoryManager.logMemoryState()
@@ -1308,7 +1355,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 5: Reload Qwen3 for text encoding
                     Flux2Debug.log("Reloading Qwen3 for Klein text encoding...")
-                    try await kleinEncoder!.load()
+                    try await kleinEncoder!.load(from: kleinEncoderPath)
 
                     profiler.end("1b. VLM Interpretation")
                 }
@@ -1363,7 +1410,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 5: Reload Qwen3 for text encoding
                     Flux2Debug.log("Reloading Qwen3 for Klein text encoding...")
-                    try await kleinEncoder!.load()
+                    try await kleinEncoder!.load(from: kleinEncoderPath)
 
                     // Step 6: Encode with Qwen3 (already upsampled, so upsample=false)
                     textEmbeddings = try kleinEncoder!.encode(enhancedPrompt, upsample: false)
@@ -1448,7 +1495,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             guard let vae = vae else {
                 throw Flux2Error.modelNotLoaded("VAE")
             }
-            let processed = preprocessImageForVAE(
+            let processed = await preprocessImageForVAE(
                 initImage,
                 targetHeight: validHeight,
                 targetWidth: validWidth
@@ -1484,7 +1531,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("Generated output noise latents: \(patchifiedLatents.shape)")
 
             // Encode ALL reference images
-            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try encodeReferenceImages(
+            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try await encodeReferenceImages(
                 images,
                 height: validHeight,
                 width: validWidth
@@ -1883,7 +1930,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
 
             // ---- 1. VAE-encode init → patchified normalized latents ----
-            let processedInit = preprocessImageForVAE(
+            let processedInit = await preprocessImageForVAE(
                 initImage,
                 targetHeight: validHeight,
                 targetWidth: validWidth
@@ -1899,7 +1946,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("[strength+refs] Encoded init to patchified: \(initPatchified.shape)")
 
             // ---- 2. Encode all Kontext reference images ----
-            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try encodeReferenceImages(
+            let (referenceLatents, referencePositionIds, refTokenMultiplier) = try await encodeReferenceImages(
                 refImages,
                 height: validHeight,
                 width: validWidth
@@ -2383,7 +2430,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         _ images: [CGImage],
         height: Int,
         width: Int
-    ) throws -> (latents: MLXArray, positionIds: MLXArray, refTokenMultiplier: MLXArray?) {
+    ) async throws -> (latents: MLXArray, positionIds: MLXArray, refTokenMultiplier: MLXArray?) {
         guard let vae = vae else {
             throw Flux2Error.modelNotLoaded("VAE")
         }
@@ -2460,7 +2507,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("  -> Resized to \(targetWidth)x\(targetHeight)")
 
             // Preprocess and encode
-            let processed = preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
+            let processed = await preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
 
             // Encode with VAE -> [1, 32, H/8, W/8]
             // IMPORTANT: Use samplePosterior=false to get deterministic mean (like diffusers argmax)
@@ -2701,7 +2748,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// preserve exact pixel values without format conversion or anti-aliasing artifacts.
     /// When a resize is needed, uses CGContext with high-quality interpolation, then
     /// reads from the resized image's dataProvider.
-    private func preprocessImageForVAE(_ image: CGImage, targetHeight: Int, targetWidth: Int) -> MLXArray {
+    private func preprocessImageForVAE(_ image: CGImage, targetHeight: Int, targetWidth: Int) async -> MLXArray {
         let sourceWidth = image.width
         let sourceHeight = image.height
 
@@ -2710,28 +2757,43 @@ public class Flux2Pipeline: @unchecked Sendable {
         if sourceWidth != targetWidth || sourceHeight != targetHeight {
             Flux2Debug.log("Resizing image from \(sourceWidth)x\(sourceHeight) to \(targetWidth)x\(targetHeight)")
 
+            // Pixel buffer is captured by the Default-QoS work item below; the
+            // CGContext keeps a pointer into it, so the buffer (and any backing
+            // storage) must outlive the draw. The continuation handshake
+            // guarantees the await returns only after the work completes, so
+            // capturing pixelData by reference via UnsafeMutablePointer is safe.
             let bytesPerPixel = 4
             let bytesPerRow = bytesPerPixel * targetWidth
-            var pixelData = [UInt8](repeating: 0, count: targetHeight * bytesPerRow)
+            let pixelCount = targetHeight * bytesPerRow
 
-            guard let context = CGContext(
-                data: &pixelData,
-                width: targetWidth,
-                height: targetHeight,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            ) else {
-                Flux2Debug.log("Failed to create resize context")
-                return MLXRandom.normal([1, 3, targetHeight, targetWidth])
+            let resized: CGImage? = await Self.runAtDefaultQoS {
+                let pixelData = UnsafeMutablePointer<UInt8>.allocate(capacity: pixelCount)
+                pixelData.initialize(repeating: 0, count: pixelCount)
+                defer {
+                    pixelData.deinitialize(count: pixelCount)
+                    pixelData.deallocate()
+                }
+
+                guard let context = CGContext(
+                    data: pixelData,
+                    width: targetWidth,
+                    height: targetHeight,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                ) else {
+                    return nil
+                }
+
+                // High quality interpolation
+                context.interpolationQuality = .high
+                context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+
+                return context.makeImage()
             }
 
-            // High quality interpolation
-            context.interpolationQuality = .high
-            context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-
-            guard let resized = context.makeImage() else {
+            guard let resized else {
                 Flux2Debug.log("Failed to create resized image")
                 return MLXRandom.normal([1, 3, targetHeight, targetWidth])
             }

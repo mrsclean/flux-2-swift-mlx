@@ -430,6 +430,20 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// VAE decoder
     private var vae: AutoencoderKLFlux2?
 
+    // K4D LOCAL PATCH (2026-05-27, TAEF2 spike): expose the VAE's BN
+    // running stats so a caller can denormalize patchified latents
+    // inside an `onStep` callback before feeding them to a separate
+    // preview decoder (TAEF2). These mirror what the pipeline's own
+    // checkpoint path calls `denormalizeLatentsWithBatchNorm(...)`
+    // with on every full-VAE preview decode. Returns nil before
+    // `loadModels()` has populated the VAE.
+    public var latentBatchNormRunningMean: MLXArray? {
+        vae?.batchNormRunningMean
+    }
+    public var latentBatchNormRunningVar: MLXArray? {
+        vae?.batchNormRunningVar
+    }
+
     /// Scheduler
     private let scheduler: FlowMatchEulerScheduler
 
@@ -953,7 +967,13 @@ public class Flux2Pipeline: @unchecked Sendable {
         precomputedEmbeddings: MLXArray? = nil,
         checkpointInterval: Int? = nil,
         onProgress: Flux2ProgressCallback? = nil,
-        onCheckpoint: Flux2CheckpointCallback? = nil
+        onCheckpoint: Flux2CheckpointCallback? = nil,
+        // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike): forward
+        // `onStep` through this convenience wrapper so K4D can hook
+        // every denoising step for in-memory latent → TAEF2 preview
+        // decoding. See docs/taef2-preview-decoder-spike.md in the
+        // K4D repo. Default nil preserves existing behavior.
+        onStep: Flux2StepHook? = nil
     ) async throws -> CGImage {
         try await generate(
             mode: .textToImage,
@@ -968,7 +988,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             precomputedEmbeddings: precomputedEmbeddings,
             checkpointInterval: checkpointInterval,
             onProgress: onProgress,
-            onCheckpoint: onCheckpoint
+            onCheckpoint: onCheckpoint,
+            onStep: onStep
         )
     }
 
@@ -1004,7 +1025,10 @@ public class Flux2Pipeline: @unchecked Sendable {
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
         onProgress: Flux2ProgressCallback? = nil,
-        onCheckpoint: Flux2CheckpointCallback? = nil
+        onCheckpoint: Flux2CheckpointCallback? = nil,
+        // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike). See the
+        // matching patch on generateTextToImage.
+        onStep: Flux2StepHook? = nil
     ) async throws -> CGImage {
         guard !images.isEmpty && images.count <= 3 else {
             throw Flux2Error.invalidConfiguration("Provide 1-3 reference images")
@@ -1026,7 +1050,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
             onProgress: onProgress,
-            onCheckpoint: onCheckpoint
+            onCheckpoint: onCheckpoint,
+            onStep: onStep
         )
     }
 
@@ -1045,7 +1070,9 @@ public class Flux2Pipeline: @unchecked Sendable {
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
         onProgress: Flux2ProgressCallback? = nil,
-        onCheckpoint: Flux2CheckpointCallback? = nil
+        onCheckpoint: Flux2CheckpointCallback? = nil,
+        // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike).
+        onStep: Flux2StepHook? = nil
     ) async throws -> CGImage {
         let images = try imageData.enumerated().map { index, data in
             guard let cgImage = Self.cgImage(from: data) else {
@@ -1065,7 +1092,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
             onProgress: onProgress,
-            onCheckpoint: onCheckpoint
+            onCheckpoint: onCheckpoint,
+            onStep: onStep
         )
     }
 
@@ -2523,7 +2551,15 @@ public class Flux2Pipeline: @unchecked Sendable {
                 runningMean: vae.batchNormRunningMean,
                 runningVar: vae.batchNormRunningVar
             )
-            eval(patchified)
+            // Intermediate eval(patchified) removed 2026-06-08 (perf):
+            // MLX is lazy — every eval() flushes the queue and stalls
+            // the GPU. The final eval(combined) at end of loop
+            // materializes every ref's pipeline in one batched GPU
+            // pass. Removing this intermediate stall saves ~30-50s per
+            // ref on M4 Pro. Re-add only if a downstream op requires
+            // patchified to be materialized in-place before next ref's
+            // iteration (it doesn't — patchified is appended via pack
+            // → squeeze → array.append, all lazy-graph operations).
 
             // K4D LOCAL PATCH — reference channel mask (2026-05-17;
             // canvas/donor gate added 2026-05-22).
@@ -2549,8 +2585,10 @@ public class Flux2Pipeline: @unchecked Sendable {
                     let highChans = patchified[0..., 64..<128, 0..., 0...]
                     patchified = concatenated([zeros64, highChans], axis: 1)
                 }
-                eval(patchified)
-                Flux2Debug.log("  -> Channel mask applied: \(referenceChannelMask.rawValue) (ref \(index + 1))")
+                // Intermediate eval removed 2026-06-08 — see note above
+                // re: lazy graph. Log only shape info (no concrete-value
+                // dependence) so we can keep the breadcrumb cheap.
+                Flux2Debug.log("  -> Channel mask applied: \(referenceChannelMask.rawValue) (ref \(index + 1), shape \(patchified.shape))")
             }
             // END K4D LOCAL PATCH — reference channel mask
 
@@ -2599,7 +2637,9 @@ public class Flux2Pipeline: @unchecked Sendable {
                 if !isDonorRef {
                     // Canvas reference — excluded from donor controls.
                     let identity = MLXArray.ones([tokenCount])
-                    eval(identity)
+                    // Intermediate eval removed 2026-06-08 — identity is
+                    // just an ones-vector; the final eval(combined)
+                    // after concat handles it. Saves a sync stall.
                     controlMultipliers.append(identity)
                     Flux2Debug.log("  -> Control multiplier: canvas ref \(index + 1) → identity (1.0)")
                 } else {
@@ -2651,7 +2691,10 @@ public class Flux2Pipeline: @unchecked Sendable {
                     }
                     // Fold the global strength scalar in.
                     let donorMult = fadeFlat * Float(referenceStrength)
-                    eval(donorMult)
+                    // Intermediate eval removed 2026-06-08 — donorMult
+                    // is appended to controlMultipliers, the final
+                    // eval(combined) after the loop materializes the
+                    // whole batched graph in one GPU pass.
                     controlMultipliers.append(donorMult)
                     Flux2Debug.log(
                         "  -> Control multiplier: donor ref \(index + 1) → " +
@@ -3038,7 +3081,9 @@ extension Flux2Pipeline {
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
         onProgress: Flux2ProgressCallback? = nil,
-        onCheckpoint: Flux2CheckpointCallback? = nil
+        onCheckpoint: Flux2CheckpointCallback? = nil,
+        // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike).
+        onStep: Flux2StepHook? = nil
     ) async throws -> CGImage {
         let targetHeight = height ?? initImage.height
         let targetWidth = width ?? initImage.width
@@ -3062,7 +3107,8 @@ extension Flux2Pipeline {
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
             onProgress: onProgress,
-            onCheckpoint: onCheckpoint
+            onCheckpoint: onCheckpoint,
+            onStep: onStep
         )
     }
 

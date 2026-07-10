@@ -37,7 +37,7 @@ struct CompareEncoders: AsyncParsableCommand {
     @Option(name: .long, help: "Output directory for comparison results")
     var outputDir: String = "./comparison"
 
-    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4")
+    @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
     var transformerQuant: String = "qint8"
 
     @Option(name: .long, help: "Local path to Qwen3-VL model (if not set, auto-downloads)")
@@ -105,7 +105,7 @@ struct CompareEncoders: AsyncParsableCommand {
         print("  Encoding time: \(String(format: "%.1f", standardElapsed))s")
 
         // Unload standard
-        await MainActor.run { FluxTextEncoders.shared.unloadKleinModel() }
+        FluxTextEncoders.shared.unloadKleinModel()
         Memory.clearCache()
 
         // ── Step 2: Qwen3-VL embeddings ──
@@ -135,7 +135,7 @@ struct CompareEncoders: AsyncParsableCommand {
         print("  Encoding time: \(String(format: "%.1f", vlElapsed))s")
 
         // Unload VL
-        await MainActor.run { FluxTextEncoders.shared.unloadKleinModel() }
+        FluxTextEncoders.shared.unloadKleinModel()
         Memory.clearCache()
 
         // ── Step 3: Compare embeddings ──
@@ -148,9 +148,7 @@ struct CompareEncoders: AsyncParsableCommand {
 
         // ── Step 4: Generate images (optional) ──
         if !embeddingsOnly {
-            guard let transformerQuantization = TransformerQuantization(rawValue: transformerQuant) else {
-                throw ValidationError("Invalid transformer quantization: \(transformerQuant)")
-            }
+            let transformerQuantization = try TransformerQuantization.parseCLI(transformerQuant)
 
             let quantConfig = Flux2QuantizationConfig(
                 textEncoder: .mlx8bit,

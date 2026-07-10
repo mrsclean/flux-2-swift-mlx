@@ -79,7 +79,7 @@ struct TextToImage: AsyncParsableCommand {
     @Option(name: .long, help: "Text encoder quantization: bf16, 8bit, 6bit, 4bit")
     var textQuant: String = "8bit"
 
-    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4")
+    @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
     var transformerQuant: String = "qint8"
 
     @Flag(name: .long, help: "Show detailed logs (model loading, config, VLM interpretation)")
@@ -192,9 +192,7 @@ struct TextToImage: AsyncParsableCommand {
             throw ValidationError("Invalid text quantization: \(textQuant). Use bf16, 8bit, 6bit, or 4bit")
         }
 
-        guard let transformerQuantization = TransformerQuantization(rawValue: transformerQuant) else {
-            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use bf16, qint8, or int4")
-        }
+        let transformerQuantization = try TransformerQuantization.parseCLI(transformerQuant)
 
         let quantConfig = Flux2QuantizationConfig(
             textEncoder: textQuantization,
@@ -404,6 +402,9 @@ struct ImageToImage: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Output image height (default: from first reference image)")
     var height: Int?
 
+    @Option(name: .long, help: "Max VAE encode budget per reference image, in megapixels (1 MP = 1024×1024; default 1.0). Raise for higher-fidelity conditioning at the cost of memory; e.g. 4.0 ≈ 2048².")
+    var maxReferenceMegapixels: Double?
+
     @Flag(name: .long, help: "Enhance prompt with visual details using Mistral before encoding")
     var upsamplePrompt: Bool = false
 
@@ -422,7 +423,7 @@ struct ImageToImage: AsyncParsableCommand {
     @Option(name: .long, help: "Text encoder quantization: bf16, 8bit, 6bit, 4bit")
     var textQuant: String = "8bit"
 
-    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4")
+    @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
     var transformerQuant: String = "qint8"
 
     @Option(name: .long, help: "LoRA adapter file (.safetensors) for style or capability adaptation")
@@ -567,9 +568,7 @@ struct ImageToImage: AsyncParsableCommand {
             throw ValidationError("Invalid text quantization: \(textQuant). Use: bf16, 8bit, 6bit, 4bit")
         }
 
-        guard let transformerQuantization = TransformerQuantization(rawValue: transformerQuant) else {
-            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
-        }
+        let transformerQuantization = try TransformerQuantization.parseCLI(transformerQuant)
 
         let quantConfig = Flux2QuantizationConfig(
             textEncoder: textQuantization,
@@ -653,6 +652,12 @@ struct ImageToImage: AsyncParsableCommand {
             checkpointDir = nil
         }
 
+        // Reference-encode budget policy: framework owns the mechanism (a per-image
+        // pixel ceiling); the CLI just maps the user-facing megapixel flag to pixels.
+        // 1 MP == 1024×1024, so the default resolves to the historical 1024² budget.
+        let maxReferencePixels = maxReferenceMegapixels
+            .map { max(32 * 32, Int(($0 * 1024 * 1024).rounded())) } ?? (1024 * 1024)
+
         let image = try await pipeline.generateImageToImage(
             prompt: prompt,
             images: refImages,
@@ -664,6 +669,7 @@ struct ImageToImage: AsyncParsableCommand {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpoint,
+            maxReferencePixels: maxReferencePixels,
             onProgress: { current, total in
                 let progress = Float(current) / Float(total) * 100
                 print("\rStep \(current)/\(total) [\(String(format: "%.0f", progress))%]", terminator: "")
@@ -713,7 +719,7 @@ struct Download: AsyncParsableCommand {
     @Option(name: .long, help: "Model to download: dev, klein-4b, klein-9b")
     var model: String = "dev"
 
-    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4")
+    @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
     var transformerQuant: String = "qint8"
 
     @Flag(name: .long, help: "Download all model variants")
@@ -776,14 +782,7 @@ struct Download: AsyncParsableCommand {
             }
         } else {
             // Parse quantization and get the right variant for this model type
-            let quant: TransformerQuantization
-            switch transformerQuant {
-            case "bf16": quant = .bf16
-            case "qint8", "8bit": quant = .qint8
-            case "int4", "4bit": quant = .int4
-            default:
-                throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use bf16, qint8, or int4")
-            }
+            let quant = try TransformerQuantization.parseCLI(transformerQuant)
 
             let variant = ModelRegistry.TransformerVariant.variant(for: modelVariant, quantization: quant)
             print("Downloading \(modelVariant.displayName) Transformer (\(variant.rawValue))...")

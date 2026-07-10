@@ -781,13 +781,14 @@ public class Flux2Pipeline: @unchecked Sendable {
         if quantization.transformer != .bf16 {
             let bits = quantization.transformer.bits
             let groupSize = quantization.transformer.groupSize
-            Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize))...")
+            let mode = quantization.transformer.mode
+            Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize), mode=\(mode.rawValue))...")
             memoryManager.logMemoryState()
-            quantize(model: transformer!, groupSize: groupSize, bits: bits)
+            quantize(model: transformer!, groupSize: groupSize, bits: bits, mode: mode)
             eval(transformer!.parameters())
             memoryManager.fullCleanup()
             memoryManager.logMemoryState()
-            Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit)")
+            Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit, \(mode.rawValue))")
         }
 
         // Merge LoRA weights if any are loaded
@@ -1024,6 +1025,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         seed: UInt64? = nil,
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil,
         onCheckpoint: Flux2CheckpointCallback? = nil,
         // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike). See the
@@ -1049,6 +1051,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
             onStep: onStep
@@ -1069,6 +1072,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         seed: UInt64? = nil,
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil,
         onCheckpoint: Flux2CheckpointCallback? = nil,
         // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike).
@@ -1091,6 +1095,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
             onStep: onStep
@@ -1143,6 +1148,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         seed: UInt64? = nil,
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil,
         onCheckpoint: Flux2CheckpointCallback? = nil
     ) async throws -> Flux2GenerationResult {
@@ -1165,6 +1171,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint
         )
@@ -1184,6 +1191,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         seed: UInt64? = nil,
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil,
         onCheckpoint: Flux2CheckpointCallback? = nil
     ) async throws -> Flux2GenerationResult {
@@ -1204,6 +1212,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint
         )
@@ -1222,6 +1231,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         upsamplePrompt: Bool,
         precomputedEmbeddings: MLXArray? = nil,
         checkpointInterval: Int?,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback?,
         onCheckpoint: Flux2CheckpointCallback?,
         onStep: Flux2StepHook? = nil
@@ -1238,6 +1248,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             upsamplePrompt: upsamplePrompt,
             precomputedEmbeddings: precomputedEmbeddings,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
             onStep: onStep
@@ -1246,6 +1257,22 @@ public class Flux2Pipeline: @unchecked Sendable {
     }
 
     /// Unified generation method with full result including used prompt
+    ///
+    /// - Parameter maxReferencePixels: I2I only — per-reference-image VAE encode
+    ///   budget in pixels (see ``encodeReferenceImages``). Ignored for text-to-image.
+    ///   Defaults to the historical 1024² budget.
+    /// - Parameter initLatents: Optional packed-sequence latents `[1, seq, 128]`
+    ///   of an init image (see ``encodeImageToPackedSequence``). Required when
+    ///   `strength < 1.0`: the denoising starts from
+    ///   `(1-σ₀)·initLatents + σ₀·noise` instead of pure noise — the img2img
+    ///   init used by diffusers' inpaint/img2img pipelines (`scale_noise`).
+    /// - Parameter strength: Denoising strength in `(0, 1]`. `1.0` (default)
+    ///   is the existing behavior: start from pure noise, full schedule.
+    ///   `< 1.0` skips the first `steps·(1-strength)` timesteps and anchors the
+    ///   start on `initLatents`, preserving the init image's low-frequency
+    ///   structure. Note the granularity: with 4-step distilled models only
+    ///   strength ≤ 0.75 actually skips a step. Ignored (with a log) when LoRA
+    ///   custom sigmas are active.
     public func generateWithResult(
         mode: Flux2GenerationMode,
         prompt: String,
@@ -1258,6 +1285,9 @@ public class Flux2Pipeline: @unchecked Sendable {
         upsamplePrompt: Bool,
         precomputedEmbeddings: MLXArray? = nil,
         checkpointInterval: Int?,
+        maxReferencePixels: Int = 1024 * 1024,
+        initLatents: MLXArray? = nil,
+        strength: Float = 1.0,
         onProgress: Flux2ProgressCallback?,
         onCheckpoint: Flux2CheckpointCallback?,
         onStep: Flux2StepHook? = nil
@@ -1277,6 +1307,14 @@ public class Flux2Pipeline: @unchecked Sendable {
         // Set random seed
         if let seed = seed {
             MLXRandom.seed(seed)
+        }
+
+        // img2img-style init (diffusers `strength` semantics)
+        let effectiveStrength = max(0.01, min(1.0, strength))
+        let useImg2ImgInit = initLatents != nil && effectiveStrength < 1.0
+        if effectiveStrength < 1.0 && initLatents == nil {
+            throw Flux2Error.invalidConfiguration(
+                "strength < 1.0 requires initLatents (packed-sequence latents of the init image, see encodeImageToPackedSequence)")
         }
 
         Flux2Debug.log("Starting generation: \(validWidth)x\(validHeight), \(steps) steps, guidance=\(guidance)")
@@ -1350,7 +1388,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 1: Unload Qwen3 to free memory for Mistral
                     Flux2Debug.log("Unloading Qwen3 to make room for Mistral VLM...")
-                    await MainActor.run { kleinEncoder?.unload() }
+                    kleinEncoder?.unload()
                     memoryManager.fullCleanup()
 
                     // Step 2: Load Mistral VLM
@@ -1378,7 +1416,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 4: Unload Mistral
                     Flux2Debug.log("Unloading Mistral VLM...")
-                    await MainActor.run { tempMistralForInterpret.unload() }
+                    tempMistralForInterpret.unload()
                     memoryManager.fullCleanup()
 
                     // Step 5: Reload Qwen3 for text encoding
@@ -1417,7 +1455,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 1: Unload Qwen3 (already loaded by loadTextEncoder) to free memory for Mistral
                     Flux2Debug.log("Unloading Qwen3 to make room for Mistral VLM...")
-                    await MainActor.run { kleinEncoder?.unload() }
+                    kleinEncoder?.unload()
                     memoryManager.fullCleanup()
 
                     // Step 2: Load Mistral VLM for vision-aware upsampling
@@ -1433,7 +1471,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 4: Unload Mistral to free memory
                     Flux2Debug.log("Unloading Mistral VLM...")
-                    await MainActor.run { tempMistralEncoder.unload() }
+                    tempMistralEncoder.unload()
                     memoryManager.fullCleanup()
 
                     // Step 5: Reload Qwen3 for text encoding
@@ -1562,7 +1600,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             let (referenceLatents, referencePositionIds, refTokenMultiplier) = try await encodeReferenceImages(
                 images,
                 height: validHeight,
-                width: validWidth
+                width: validWidth,
+                maxReferencePixels: maxReferencePixels
             )
             eval(referenceLatents)
             Flux2Debug.log("Encoded \(images.count) reference images: latents \(referenceLatents.shape), posIds \(referencePositionIds.shape)")
@@ -1592,12 +1631,39 @@ public class Flux2Pipeline: @unchecked Sendable {
             let combinedImageIds = concatenated([outputImageIds, referencePositionIds], axis: 0)
             Flux2Debug.log("Combined image IDs: \(combinedImageIds.shape)")
 
-            // Setup scheduler for FULL denoising (no timestep skip in Flux.2 I2I)
+            // Setup scheduler. Flux.2 I2I conditioning itself never skips
+            // timesteps; the optional img2img init (initLatents + strength)
+            // is an orthogonal, caller-requested anchor on the OUTPUT latents.
             // Check for custom sigmas from LoRA (e.g., Turbo LoRAs)
             if let customSigmas = loraSchedulerOverrides?.customSigmas {
+                if useImg2ImgInit {
+                    Flux2Debug.log("Warning: LoRA custom sigmas active — strength/initLatents ignored")
+                }
                 scheduler.setCustomSigmas(customSigmas)
             } else {
-                scheduler.setTimesteps(numInferenceSteps: steps, imageSeqLen: outputSeqLen, strength: 1.0)
+                scheduler.setTimesteps(
+                    numInferenceSteps: steps,
+                    imageSeqLen: outputSeqLen,
+                    strength: useImg2ImgInit ? effectiveStrength : 1.0
+                )
+                // A too-low strength slices the schedule down to the terminal
+                // sigma only (zero denoising steps): the standard loops would
+                // silently no-op and the KV path would crash on sigmas[1].
+                if useImg2ImgInit && scheduler.sigmas.count < 2 {
+                    throw Flux2Error.invalidConfiguration(
+                        "strength \(effectiveStrength) with \(steps) steps yields zero denoising steps — use strength ≥ 1/steps (here ≥ \(String(format: "%.2f", 1.0 / Float(max(1, steps))))).")
+                }
+                if useImg2ImgInit, let initLatents = initLatents {
+                    guard initLatents.shape == packedOutputLatents.shape else {
+                        throw Flux2Error.invalidConfiguration(
+                            "initLatents shape \(initLatents.shape) does not match output latents shape \(packedOutputLatents.shape)")
+                    }
+                    // diffusers scale_noise: latents = (1-σ₀)·init + σ₀·noise
+                    let sigma0 = MLXArray(scheduler.initialSigma)
+                    packedOutputLatents = (1 - sigma0) * initLatents + sigma0 * packedOutputLatents
+                    eval(packedOutputLatents)
+                    Flux2Debug.log("img2img init: strength=\(effectiveStrength), σ₀=\(scheduler.initialSigma)")
+                }
             }
 
             let effectiveSteps = scheduler.sigmas.count - 1
@@ -2189,38 +2255,73 @@ public class Flux2Pipeline: @unchecked Sendable {
 
         // Setup scheduler.
         //
-        // K4D LOCAL PATCH: extract strength from the mode so the
-        // .strengthImageToImage path can request a partial trajectory
-        // (e.g. strength=0.7 → start denoising from sigma≈0.7
-        // instead of 1.0, skipping the early-noise steps). For
-        // .textToImage and any future case, the default 1.0 keeps the
-        // pre-patch behavior bit-identical.
-        let effectiveStrength: Float = {
+        // Two mutually-exclusive img2img mechanisms feed the starting sigma;
+        // a given call uses at most one:
+        //   • Upstream `initLatents` + `strength` params (used by the masked
+        //     inpainting chain) → `useImg2ImgInit` is true.
+        //   • K4D LOCAL PATCH `.strengthImageToImage` mode, which carries its
+        //     strength in the enum and leaves the params at their defaults
+        //     (so `useImg2ImgInit` is false). `modeStrength` extracts it, so
+        //     the path can request a partial trajectory (e.g. 0.7 → start
+        //     from σ≈0.7, skipping the early-noise steps).
+        // For `.textToImage` both are inert and strength stays 1.0 —
+        // pre-patch behavior is bit-identical.
+        let modeStrength: Float = {
             if case .strengthImageToImage(_, let s) = mode { return s }
             return 1.0
         }()
+        // Check for custom sigmas from LoRA (e.g., Turbo LoRAs)
         if let customSigmas = loraSchedulerOverrides?.customSigmas {
+            if useImg2ImgInit || modeStrength < 1.0 {
+                Flux2Debug.log("Warning: LoRA custom sigmas active — strength/initLatents ignored")
+            }
             scheduler.setCustomSigmas(customSigmas)
         } else {
-            scheduler.setTimesteps(numInferenceSteps: steps, imageSeqLen: imageSeqLen, strength: effectiveStrength)
-        }
-
-        // K4D LOCAL PATCH: FlowMatch noise injection for strength
-        // img2img. After the scheduler has resolved its (possibly
-        // truncated) sigma schedule, blend the CLEAN init latent
-        // with fresh noise at the starting sigma:
-        //
-        //     x_start = (1 - σ_start) * init + σ_start * noise
-        //
-        // This is the rectified-flow analog of SD's "noise at the
-        // strength's timestep." With strength=1.0, σ_start=1.0 and
-        // the formula reduces to pure noise — regression-safe.
-        if case .strengthImageToImage = mode {
-            let startSigma = scheduler.sigmas[0]
-            let noise = MLXRandom.normal(packedLatents.shape)
-            packedLatents = MLXArray(1 - startSigma) * packedLatents + MLXArray(startSigma) * noise
-            eval(packedLatents)
-            Flux2Debug.log("Strength-img2img noise blend: σ_start=\(startSigma), strength=\(effectiveStrength)")
+            // Whichever mechanism is active supplies the starting strength.
+            let schedulerStrength: Float = useImg2ImgInit ? effectiveStrength : modeStrength
+            scheduler.setTimesteps(
+                numInferenceSteps: steps,
+                imageSeqLen: imageSeqLen,
+                strength: schedulerStrength
+            )
+            // A too-low strength slices the schedule down to the terminal
+            // sigma only (zero denoising steps) — surface it instead of
+            // silently returning the un-edited init image.
+            if (useImg2ImgInit || modeStrength < 1.0) && scheduler.sigmas.count < 2 {
+                throw Flux2Error.invalidConfiguration(
+                    "strength \(schedulerStrength) with \(steps) steps yields zero denoising steps — use strength ≥ 1/steps (here ≥ \(String(format: "%.2f", 1.0 / Float(max(1, steps))))).")
+            }
+            // Upstream: diffusers scale_noise on caller-supplied initLatents.
+            if useImg2ImgInit, let initLatents = initLatents {
+                guard initLatents.shape == packedLatents.shape else {
+                    throw Flux2Error.invalidConfiguration(
+                        "initLatents shape \(initLatents.shape) does not match latents shape \(packedLatents.shape)")
+                }
+                // diffusers scale_noise: latents = (1-σ₀)·init + σ₀·noise
+                let sigma0 = MLXArray(scheduler.initialSigma)
+                packedLatents = (1 - sigma0) * initLatents + sigma0 * packedLatents
+                eval(packedLatents)
+                Flux2Debug.log("img2img init: strength=\(effectiveStrength), σ₀=\(scheduler.initialSigma)")
+            }
+            // K4D LOCAL PATCH: FlowMatch noise injection for the
+            // `.strengthImageToImage` mode. After the scheduler resolves its
+            // (possibly truncated) sigma schedule, blend the CLEAN init
+            // latent (encoded in the `switch mode` above) with fresh noise at
+            // the starting sigma:
+            //
+            //     x_start = (1 - σ_start) * init + σ_start * noise
+            //
+            // The rectified-flow analog of SD's "noise at the strength's
+            // timestep." With strength=1.0, σ_start=1.0 → pure noise —
+            // regression-safe. Skipped under custom LoRA sigmas (strength is
+            // ignored there, matching the warning above).
+            if case .strengthImageToImage = mode {
+                let startSigma = scheduler.sigmas[0]
+                let noise = MLXRandom.normal(packedLatents.shape)
+                packedLatents = MLXArray(1 - startSigma) * packedLatents + MLXArray(startSigma) * noise
+                eval(packedLatents)
+                Flux2Debug.log("Strength-img2img noise blend: σ_start=\(startSigma), strength=\(modeStrength)")
+            }
         }
 
         let effectiveSteps = scheduler.sigmas.count - 1
@@ -2447,6 +2548,11 @@ public class Flux2Pipeline: @unchecked Sendable {
     ///   - images: Reference images (1-10 supported)
     ///   - height: Target output height
     ///   - width: Target output width
+    ///   - maxReferencePixels: Per-image ceiling, in pixels, for the VAE
+    ///     conditioning encode. Any reference larger than this is downscaled
+    ///     (preserving aspect ratio) before encoding, which bounds token count
+    ///     and VRAM. Policy owned by the caller; defaults to the historical
+    ///     1024² budget (diffusers `pipeline_flux2.py:892-893`).
     /// - Returns: Tuple of (latents [1, seq_len, 128], position IDs
     ///   [seq_len, 4], refTokenMultiplier [total_ref_tokens] or nil).
     ///   `refTokenMultiplier` is the unified donor-control scale —
@@ -2457,7 +2563,8 @@ public class Flux2Pipeline: @unchecked Sendable {
     private func encodeReferenceImages(
         _ images: [CGImage],
         height: Int,
-        width: Int
+        width: Int,
+        maxReferencePixels: Int = 1024 * 1024
     ) async throws -> (latents: MLXArray, positionIds: MLXArray, refTokenMultiplier: MLXArray?) {
         guard let vae = vae else {
             throw Flux2Error.modelNotLoaded("VAE")
@@ -2481,10 +2588,12 @@ public class Flux2Pipeline: @unchecked Sendable {
         )
 
         // === STEP 1: Process each image separately ===
-        // Max area per image - matches diffusers pipeline_flux2.py line 892-893
-        // Reference uses 1024² for conditioning images (not 768² which is for upsampling)
-        let maxImageArea = 1024 * 1024  // ~4096 tokens per image
+        // Max area per image — caller-supplied policy (see `maxReferencePixels`).
+        // Historical default is 1024² (matches diffusers pipeline_flux2.py line
+        // 892-893; conditioning images, not the 768² upsampling budget). Floored
+        // at one 32px tile so a pathological value can never zero out the encode.
         let multipleOf = 32  // vae_scale_factor * 2
+        let maxImageArea = max(maxReferencePixels, multipleOf * multipleOf)  // ~4096 tokens/image at 1024²
 
         var allPackedLatents: [MLXArray] = []
         var latentHeights: [Int] = []

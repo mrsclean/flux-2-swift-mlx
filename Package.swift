@@ -16,11 +16,15 @@ let package = Package(
         .executable(name: "Flux2App", targets: ["Flux2App"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.2"),
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
-        .package(url: "https://github.com/jpsim/Yams", from: "5.1.0"),
-        .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.1.1"),
+        // Pinned exactly: mlx-swift introduces breaking API changes even in patch
+        // releases (e.g. AdamW TupleState -> AdamState in 0.31.4). Bump deliberately.
+        // 0.31.6 verified against the full Metal test suite + a generation run;
+        // 0.31.5+ requires a Swift 6.3 toolchain (Xcode 26+).
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.6"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
+        .package(url: "https://github.com/jpsim/Yams", from: "6.0.0"),
+        .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.4.0"),
     ],
     targets: [
         // MARK: - Libraries

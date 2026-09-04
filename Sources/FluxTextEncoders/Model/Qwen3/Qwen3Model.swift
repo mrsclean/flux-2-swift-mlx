@@ -220,18 +220,42 @@ public class Qwen3Model: Module {
 public class Qwen3ForCausalLM: Module {
     public let config: Qwen3TextConfig
     public var model: Qwen3Model
-    @ModuleInfo public var lm_head: Linear
+    /// K4D LOCAL PATCH (2026-09-04): optional so a hidden-state-only
+    /// consumer (Klein's text encoder) can skip allocating it. For the 8B
+    /// encoder that's a 4096x151936 matrix — ~0.6 GB at 8-bit — that the
+    /// FLUX.2 conditioning path never reads. nil only when
+    /// `kleinTapDepthOverride` is set; the chat/LLM path is unchanged.
+    @ModuleInfo public var lm_head: Linear?
 
     /// When true, use embed_tokens.weight for lm_head (weight tying)
     public var useTiedWeights: Bool = false
 
-    public init(config: Qwen3TextConfig) {
+    /// K4D LOCAL PATCH (2026-09-04) — depth cap for hidden-state-only use.
+    ///
+    /// FLUX.2 Klein conditions on Qwen3 hidden states from layers
+    /// [9, 18, 27] and nothing deeper; a hidden state at layer N depends
+    /// only on layers 0...N, so layers 28-35 and `lm_head` are loaded and
+    /// never read. Set this to `28` (= max tap + 1) before `load(from:)`
+    /// and the model is built with 28 layers, no `lm_head`, and the
+    /// weight loader drops the corresponding keys. Output is bit-identical
+    /// to the full model by construction. Saves ~8 layers + lm_head of
+    /// resident memory (~2.1 GB on the 8-bit 8B encoder).
+    ///
+    /// nil (default) = upstream behavior. Do NOT set this in a process
+    /// that also uses the model for chat/generation — `lm_head` will be
+    /// absent (logits fall back to tied embeddings, which is wrong for
+    /// untied checkpoints such as Qwen3-8B).
+    nonisolated(unsafe) public static var kleinTapDepthOverride: Int? = nil
+
+    public init(config: Qwen3TextConfig, loadLmHead: Bool = true) {
         self.config = config
         self.model = Qwen3Model(config: config)
 
         // LM head - for Qwen3, tie_word_embeddings is typically true
         // Weight tying will be handled via useTiedWeights flag
-        self._lm_head = ModuleInfo(wrappedValue: Linear(config.hiddenSize, config.vocabSize, bias: false))
+        self._lm_head = ModuleInfo(wrappedValue: loadLmHead
+            ? Linear(config.hiddenSize, config.vocabSize, bias: false)
+            : nil)
 
         super.init()
     }
@@ -266,8 +290,13 @@ public class Qwen3ForCausalLM: Module {
                 // output shape: [batch, seq, vocab_size]
                 return MLX.matmul(hiddenStates, model.embed_tokens.weight.T)
             }
-        } else {
+        } else if let lm_head {
             return lm_head(hiddenStates)
+        } else {
+            // K4D LOCAL PATCH: lm_head was skipped (kleinTapDepthOverride).
+            // Never reached on the hidden-state path; keep the LLM path
+            // from crashing by falling back to tied embeddings.
+            return MLX.matmul(hiddenStates, model.embed_tokens.weight.T)
         }
     }
 
@@ -331,9 +360,18 @@ extension Qwen3ForCausalLM {
     /// Load model from path
     public static func load(from modelPath: String) throws -> Qwen3ForCausalLM {
         // Load config
-        let config = try Qwen3TextConfig.load(from: "\(modelPath)/config.json")
+        var config = try Qwen3TextConfig.load(from: "\(modelPath)/config.json")
 
-        let model = Qwen3ForCausalLM(config: config)
+        // K4D LOCAL PATCH (2026-09-04): cap depth + skip lm_head for
+        // hidden-state-only consumers. See `kleinTapDepthOverride`.
+        var loadLmHead = true
+        if let depth = kleinTapDepthOverride, depth < config.numHiddenLayers {
+            FluxDebug.log("Qwen3: kleinTapDepthOverride=\(depth) — building \(depth)/\(config.numHiddenLayers) layers, no lm_head")
+            config.numHiddenLayers = depth
+            loadLmHead = false
+        }
+
+        let model = Qwen3ForCausalLM(config: config, loadLmHead: loadLmHead)
 
         // Check for quantization config
         let configPath = "\(modelPath)/config.json"
@@ -386,10 +424,23 @@ extension Qwen3ForCausalLM {
         // Convert HuggingFace weight keys to MLX Swift format
         var convertedWeights: [String: MLXArray] = [:]
 
+        // K4D LOCAL PATCH (2026-09-04): when the model was built shallower
+        // than the checkpoint (kleinTapDepthOverride) or without lm_head,
+        // drop those keys up front — `verify: .noUnusedKeys` below would
+        // otherwise reject the file's extra tensors.
+        let depth = config.numHiddenLayers
+        let layerRe = try! NSRegularExpression(pattern: #"layers\.(\d+)\."#)
+        var dropped = 0
         for (key, value) in weights {
+            if lm_head == nil, key.contains("lm_head") { dropped += 1; continue }
+            if let m = layerRe.firstMatch(in: key, range: NSRange(key.startIndex..., in: key)),
+               let r = Range(m.range(at: 1), in: key), let idx = Int(key[r]), idx >= depth {
+                dropped += 1; continue
+            }
             let swiftKey = convertKeyName(key)
             convertedWeights[swiftKey] = value
         }
+        if dropped > 0 { FluxDebug.log("Qwen3: skipped \(dropped) tensors beyond depth \(depth)/lm_head") }
 
         FluxDebug.log("Converting \(convertedWeights.count) Qwen3 weight tensors...")
 

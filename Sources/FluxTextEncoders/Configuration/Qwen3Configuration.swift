@@ -17,7 +17,10 @@ public struct Qwen3TextConfig: Codable, Sendable {
     public let vocabSize: Int
     public let hiddenSize: Int
     public let intermediateSize: Int
-    public let numHiddenLayers: Int
+    // K4D LOCAL PATCH (2026-09-04): `var` so a loader can cap the depth
+    // (Klein taps layers [9,18,27] and never reads past 27 — see
+    // `Qwen3ForCausalLM.kleinTapDepthOverride`).
+    public var numHiddenLayers: Int
     public let numAttentionHeads: Int
     public let numKeyValueHeads: Int
     public let maxPositionEmbeddings: Int

@@ -2043,7 +2043,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             let (referenceLatents, referencePositionIds, refTokenMultiplier) = try await encodeReferenceImages(
                 refImages,
                 height: validHeight,
-                width: validWidth
+                width: validWidth,
+                maxReferencePixels: maxReferencePixels   // K4D: reference-grid dial (2026-09-04)
             )
             eval(referenceLatents)
             Flux2Debug.log("[strength+refs] Encoded \(refImages.count) refs: latents \(referenceLatents.shape), posIds \(referencePositionIds.shape)")
@@ -2627,8 +2628,14 @@ public class Flux2Pipeline: @unchecked Sendable {
             var targetHeight = image.height
             let pixelCount = targetWidth * targetHeight
 
-            if pixelCount > maxImageArea {
-                let scale = sqrt(Double(maxImageArea) / Double(pixelCount))
+            // K4D LOCAL PATCH (2026-09-04, reference grid): the encode
+            // budget is a DONOR control. Canvas refs are the render
+            // target and are never coarsened below the historical 1024²
+            // — the dial can only lower donors. A caller raising the
+            // budget above 1024² still lifts both.
+            let budgetArea = isDonorRef ? maxImageArea : max(maxImageArea, 1024 * 1024)
+            if pixelCount > budgetArea {
+                let scale = sqrt(Double(budgetArea) / Double(pixelCount))
                 targetWidth = Int(Double(targetWidth) * scale)
                 targetHeight = Int(Double(targetHeight) * scale)
             }
@@ -3189,6 +3196,10 @@ extension Flux2Pipeline {
         seed: UInt64? = nil,
         upsamplePrompt: Bool = false,
         checkpointInterval: Int? = nil,
+        // K4D LOCAL PATCH (2026-09-04, reference grid): per-image VAE
+        // encode budget for `references` — the "how many reference
+        // tokens" dial. Default = upstream's historical 1024².
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil,
         onCheckpoint: Flux2CheckpointCallback? = nil,
         // K4D LOCAL PATCH (2026-05-27, TAEF2 preview spike).
@@ -3215,6 +3226,7 @@ extension Flux2Pipeline {
             seed: seed,
             upsamplePrompt: upsamplePrompt,
             checkpointInterval: checkpointInterval,
+            maxReferencePixels: maxReferencePixels,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
             onStep: onStep

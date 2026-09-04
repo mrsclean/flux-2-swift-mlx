@@ -82,6 +82,11 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     /// tabby's grey-striped head). Leave nil and rely on a descriptive
     /// Flux 2-style prompt; see ``prompt``.
     public let referenceImages: [CGImage]?
+    /// K4D LOCAL PATCH (2026-09-04): per-image VAE encode budget for
+    /// `referenceImages` (the reference-grid dial). Default 1024² =
+    /// upstream behavior. Independent of `maxPixels`, which bounds the
+    /// working canvas, not the references.
+    public let maxReferencePixels: Int
     /// When `referenceImages` is nil, auto-condition the transformer on
     /// ``image`` itself.
     ///
@@ -264,6 +269,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
         enrichPromptWithVLM: Bool = false,
         intent: Flux2InpaintIntent = .replace,
         maxPixels: Int = 1024 * 1024,
+        maxReferencePixels: Int = 1024 * 1024,
         onProgress: Flux2ProgressCallback? = nil
     ) {
         self.pipeline = pipeline
@@ -272,6 +278,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
         self.mask = mask
         self.maskConvention = maskConvention
         self.referenceImages = referenceImages
+        self.maxReferencePixels = maxReferencePixels
         self.useImageAsReference = useImageAsReference
         self.steps = steps
         self.guidance = guidance
@@ -418,6 +425,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
             upsamplePrompt: resolvedUpsample,
             precomputedEmbeddings: nil,
             checkpointInterval: nil,
+            maxReferencePixels: maxReferencePixels,
             initLatents: strength < 1.0 ? imageLatents : nil,
             strength: strength,
             onProgress: onProgress,

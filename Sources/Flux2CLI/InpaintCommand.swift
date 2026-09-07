@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
 import Flux2Core
 import Flux2Chains
 import FluxTextEncoders
+import MLX
 
 /// User-facing string mapping for ``Flux2MaskConvention``.
 ///
@@ -88,17 +89,14 @@ struct Inpaint: AsyncParsableCommand {
     @Flag(name: .long, help: "Text-encoder-only prompt rewriting (Mistral/Klein-Qwen3). Does NOT look at the image. For image-aware rewriting that inherits the source's lighting/camera/materials, use --enrich-prompt-with-vlm instead.")
     var upsamplePrompt: Bool = false
 
-    @Flag(name: .long, help: "Image-aware prompt rewriting via the bundled Qwen3.5 VLM. The VLM looks at --image and rewrites --prompt into a 30-80 word BFL-style Flux 2 prompt that inherits the source's photographic identity (camera angle, lighting direction, materials, palette, depth of field). Strictly optional: if the VLM is not loaded, the chain falls back to --prompt verbatim with a warning. Note: this CLI does NOT auto-load the VLM; load it ahead of time via FluxEncodersCLI or the test-qwen35 command. When both --upsample-prompt and --enrich-prompt-with-vlm are set, the VLM wins.")
+    @Flag(name: .long, help: "Image-aware prompt rewriting via a VLM (--vlm-provider: bundled Qwen3.5 by default, or Gemma 4 E2B). The VLM looks at --image and rewrites --prompt into a 30-80 word BFL-style Flux 2 prompt that inherits the source's photographic identity (camera angle, lighting direction, materials, palette, depth of field). Strictly optional: if no VLM is loaded, the chain falls back to --prompt verbatim with a warning. Pass --qwen35-variant/--qwen35-path (or --gemma4-variant/--gemma4-path) to have this command load one in-process. When both --upsample-prompt and --enrich-prompt-with-vlm are set, the VLM wins.")
     var enrichPromptWithVLM: Bool = false
 
     @Option(name: .long, help: "Drives --enrich-prompt-with-vlm (ignored otherwise). 'replace' = swap object X for Y (default). 'remove' = clear object X, surface continues. 'modify' = keep object X but change colour/outfit/expression. 'change-scene' = keep subject exactly as-is, change the scene around it (use this when the mask preserves the subject — e.g. 'put the cat at the pool').")
     var intent: InpaintIntentArg = .replace
 
-    @Option(name: .long, help: "Qwen3.5 VLM variant to load in-process when --enrich-prompt-with-vlm is set: '8bit' (default, 5 GB, recommended) or '4bit' (3 GB, faster but lower quality). Auto-downloads if missing. Omit to skip loading — the chain will then fall back to --prompt verbatim and emit a warning.")
-    var qwen35Variant: String?
-
-    @Option(name: .long, help: "Override the local path to Qwen3.5 VLM weights (alternative to --qwen35-variant for sandboxed apps).")
-    var qwen35Path: String?
+    /// `--vlm-provider`, `--qwen35-variant|-path`, `--gemma4-variant|-path`.
+    @OptionGroup var vlmOptions: VLMProviderOptions
 
     @Option(name: .long, help: "Denoising steps for FLUX.2 (4 for distilled klein, 25-28 for base/dev).")
     var steps: Int = 4
@@ -112,8 +110,31 @@ struct Inpaint: AsyncParsableCommand {
     var strength: Float = 1.0
     @Option(name: .long, help: "Crop-and-stitch padding in pixels (like diffusers padding_mask_crop). When set, inpaint only a crop around the mask (full token budget on the edit) and paste the result back onto the untouched original — output keeps the original resolution. Typical: 32-64. Recommended when the mask is small relative to the photo.")
     var maskCropPadding: Int?
+
+    @Option(name: .long, help: "Text encoder quantization: bf16, 8bit, 6bit, 4bit")
+    var textQuant: String = "4bit"
+
+    @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
+    var transformerQuant: String = "qint8"
+
+    @Flag(name: .long, help: "Show detailed per-phase performance profiling (model loads, text encoding, VAE encodes, per-step timings).")
+    var profile: Bool = false
+
+    @OptionGroup var beaconOptions: BeaconOptions
+
+    @Option(name: .long, help: "Run the chain N times in the same process (same pipeline instance) to separate cold-start (first run: kernel compilation, cache warm-up) from steady-state. Default 1.")
+    var repeatCount: Int = 1
+
+    @Flag(name: .long, help: "Clear the MLX GPU buffer cache between --repeat-count runs (diagnostic for run-to-run slowdown).")
+    var cleanupBetweenRuns: Bool = false
+
+    @Flag(name: .long, help: "Compile the denoising transformer forward with MLX.compile (experimental, benchmarking only). Measured neutral on klein-9b bf16 — the elementwise hot spots are already hand-fused; steps are GEMM-bound. Forces memoryOptimization to .disabled (higher peak memory) and pays a one-time trace on the first step. Output is numerically identical.")
+    var compileStep: Bool = false
     @Flag(name: .long, help: "Composite the generated canvas back onto the original in pixel space using the soft mask (kept pixels stay bit-identical, no VAE roundtrip). Implied by --mask-crop-padding.")
     var compositeOnOriginal: Bool = false
+
+    @Flag(name: .long, help: "Keep the text encoder loaded between generations instead of reloading it each time (memory-first default). Saves ~1s warm / several seconds cold per generation at the cost of encoder + transformer resident simultaneously (Klein-9B: ≈ +5 GB). Enable on machines with RAM headroom.")
+    var keepTextEncoder: Bool = false
 
     func run() async throws {
         @Sendable func logErr(_ msg: String) {
@@ -121,6 +142,7 @@ struct Inpaint: AsyncParsableCommand {
         }
 
         configureModelsDirectory(modelsDir)
+        beaconOptions.activate()
 
         guard let imageCG = Self.loadCGImage(at: image) else {
             throw ValidationError("Could not decode image at \(image)")
@@ -132,55 +154,40 @@ struct Inpaint: AsyncParsableCommand {
         logErr("Mask : \(mask) (\(maskCG.width)×\(maskCG.height))")
         logErr("Prompt: \(prompt)")
 
-        let modelChoice: Flux2Model
-        switch fluxModel.lowercased() {
-        case "klein-9b", "klein9b":               modelChoice = .klein9B
-        case "klein-9b-base", "klein9b-base":     modelChoice = .klein9BBase
-        case "klein-9b-kv", "klein9b-kv":         modelChoice = .klein9BKV
-        case "klein-4b", "klein4b":               modelChoice = .klein4B
-        case "klein-4b-base", "klein4b-base":     modelChoice = .klein4BBase
-        case "dev":                               modelChoice = .dev
-        default:
-            throw ValidationError("Unsupported --flux-model '\(fluxModel)'.")
-        }
+        let modelChoice = try Flux2Model.parseCLI(fluxModel)
 
-        // Optional Qwen3.5 VLM load — only relevant when the user opts
-        // into --enrich-prompt-with-vlm. The chain itself doesn't
-        // auto-load; we do it here at the CLI level so a single
-        // invocation is enough to benchmark the VLM-enriched path.
+        // Optional VLM load — only relevant when the user opts into
+        // --enrich-prompt-with-vlm. The chain itself doesn't auto-load; we do
+        // it here at the CLI level so a single invocation is enough to
+        // benchmark the VLM-enriched path.
         if enrichPromptWithVLM {
             // Surface the VLM-built prompt via FluxDebug.info so the
             // user can audit what FLUX.2 actually receives.
             FluxDebug.isEnabled = true
-            if qwen35Variant == nil, qwen35Path == nil {
-                logErr("WARNING: --enrich-prompt-with-vlm is set but neither --qwen35-variant nor --qwen35-path was provided — the chain will fall back to --prompt verbatim.")
-            }
         }
-        if let qwen35Path {
-            logErr("Loading Qwen3.5 VLM from \(qwen35Path) ...")
-            try await FluxTextEncoders.shared.loadQwen35VLM(from: qwen35Path)
-            logErr("✓ Qwen3.5 VLM loaded")
-        } else if let variantStr = qwen35Variant {
-            let selectedVariant: Qwen35Variant
-            switch variantStr.lowercased() {
-            case "4bit": selectedVariant = .qwen35_4B_4bit
-            case "8bit": selectedVariant = .qwen35_4B_8bit
-            default: throw ValidationError("Unsupported --qwen35-variant '\(variantStr)' (use '8bit' or '4bit')")
-            }
-            logErr("Downloading/loading Qwen3.5 VLM (\(selectedVariant.displayName)) ...")
-            let downloader = TextEncoderModelDownloader()
-            let path = try await downloader.downloadQwen35(variant: selectedVariant) { progress, message in
-                logErr("  [\(Int(progress * 100))%] \(message)")
-            }
-            try await FluxTextEncoders.shared.loadQwen35VLM(from: path.path)
-            logErr("✓ Qwen3.5 VLM loaded")
+        try await vlmOptions.loadIfRequested(
+            enrichmentRequested: enrichPromptWithVLM, logErr: logErr
+        )
+
+        guard let textQuantization = MistralQuantization(rawValue: textQuant) else {
+            throw ValidationError("Invalid text quantization: \(textQuant). Use bf16, 8bit, 6bit, or 4bit")
+        }
+        let quantConfig = Flux2QuantizationConfig(
+            textEncoder: textQuantization,
+            transformer: try TransformerQuantization.parseCLI(transformerQuant)
+        )
+
+        if profile {
+            Flux2Profiler.shared.enable()
         }
 
         let pipeline = Flux2Pipeline(
             model: modelChoice,
-            quantization: .memoryEfficient,
+            quantization: quantConfig,
             vaeVariant: .smallDecoder
         )
+        pipeline.compileDenoisingStep = compileStep
+        pipeline.keepTextEncoderLoaded = keepTextEncoder
         let loadStart = Date()
         try await pipeline.loadModels()
         logErr("✓ Flux2 pipeline ready in \(String(format: "%.1fs", Date().timeIntervalSince(loadStart)))")
@@ -217,11 +224,52 @@ struct Inpaint: AsyncParsableCommand {
             }
         )
 
-        let runStart = Date()
-        let result = try await chain.run()
-        logErr("✓ Inpainting done in \(String(format: "%.1fs", Date().timeIntervalSince(runStart)))")
-        try Self.savePNG(result.image, to: output)
-        logErr("✓ Inpainted image → \(output)")
+        guard repeatCount >= 1 else {
+            throw ValidationError("--repeat-count must be ≥ 1")
+        }
+        @Sendable func logMLXMemory(_ label: String) {
+            let active = MLX.Memory.activeMemory / 1_048_576
+            let peak = MLX.Memory.peakMemory / 1_048_576
+            let cache = MLX.Memory.cacheMemory / 1_048_576
+            var info = mach_task_basic_info()
+            var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+            let kr = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+                }
+            }
+            let rss = kr == KERN_SUCCESS ? "\(info.resident_size / 1_048_576) MB" : "n/a"
+            logErr("[mem \(label)] MLX active=\(active) MB peak=\(peak) MB cache=\(cache) MB | RSS=\(rss)")
+        }
+
+        var wallTimes: [TimeInterval] = []
+        for runIndex in 1...repeatCount {
+            if profile { Flux2Profiler.shared.reset() }
+            if cleanupBetweenRuns && runIndex > 1 {
+                MLX.Memory.clearCache()
+                logErr("[mem] cleared MLX cache between runs")
+            }
+            logMLXMemory("before run \(runIndex)")
+            let runStart = Date()
+            let result = try await chain.run()
+            let wall = Date().timeIntervalSince(runStart)
+            wallTimes.append(wall)
+            logMLXMemory("after run \(runIndex)")
+            logErr("✓ Inpainting run \(runIndex)/\(repeatCount) done in \(String(format: "%.1fs", wall))")
+            if profile {
+                print(Flux2Profiler.shared.generateReport())
+            }
+            if runIndex == repeatCount {
+                try Self.savePNG(result.image, to: output)
+                logErr("✓ Inpainted image → \(output)")
+            }
+        }
+        if repeatCount > 1 {
+            let summary = wallTimes.enumerated()
+                .map { "run \($0.offset + 1): \(String(format: "%.1fs", $0.element))" }
+                .joined(separator: "  |  ")
+            logErr("Σ wall times — \(summary)")
+        }
     }
 
     private static func loadCGImage(at path: String) -> CGImage? {

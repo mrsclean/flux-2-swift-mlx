@@ -36,6 +36,7 @@ A native Swift implementation of [Flux.2](https://blackforestlabs.ai/) image gen
 - **Image-to-Image Training**: Train paired I2I LoRAs (e.g. style transfer, image restoration)
 - **CLI Tool**: Full-featured command-line interface (`Flux2CLI`)
 - **macOS App**: Demo SwiftUI application (`Flux2App`) with T2I, I2I, and chat
+- **Engineering knowledge base**: measured baselines, decisions and verified pitfalls ([docs/knowledge](docs/knowledge/index.md), OKF-structured — readable by humans and agents)
 
 ### Chains (Flux2Chains)
 - **`Flux2Chain` protocol**: composable, single-shot inference jobs returning
@@ -64,6 +65,7 @@ A native Swift implementation of [Flux.2](https://blackforestlabs.ai/) image gen
 - **Mistral Small 3.2 (24B)**: Text encoder for FLUX.2 dev/pro
 - **Qwen3 (4B/8B)**: Text encoder for FLUX.2 Klein
 - **Qwen3.5-4B VLM**: Native vision-language model for image analysis (~3GB, auto-downloaded)
+- **Gemma 4 E2B VLM (opt-in)**: Alternative provider for the same enrichment services, via [gemma-4-swift-mlx](https://github.com/VincentGourbin/gemma-4-swift-mlx) — link `FluxGemma4VLM` and call `FluxGemma4VLM.activate()` ([VLM API](docs/VLM-API.md#providers))
 - **FLUX.2 Image Description**: VLM-powered image analysis optimized for FLUX.2 regeneration
 - **Image Comparison**: Score two images on scene and style fidelity (0-10)
 - **Text Generation**: Streaming text generation with configurable parameters
@@ -237,6 +239,25 @@ flux2 t2i "a cat" --model klein-4b --vae-variant small-decoder
 
 See [Small Decoder Benchmark](docs/examples/small-decoder/) for measured performance and visual comparison.
 
+## Activity Beacon (Opt-in)
+
+Heavy operations (generation, model loading, LoRA training, quantized export) can advertise themselves to external activity monitors such as [SiliconScope](https://github.com/kennss/SiliconScope). While the operation runs, a small JSON manifest lives at `~/Library/Application Support/ai-runtime-beacons/<pid>-<id>.json` and is deleted the moment it ends — errors included. Nothing is ever written unless you opt in:
+
+```swift
+// Swift package
+RuntimeBeacon.isEnabled = true
+```
+
+```bash
+# CLI: --beacon flag (t2i / i2i / inpaint / outpaint / train-lora / export-quantized /
+# profile / compare-encoders / evaluate-lora), or the environment variable
+FLUX2_RUNTIME_BEACON=1 flux2 t2i "..."
+```
+
+The manifest schema is deliberately runtime-agnostic (`version`, `pid`, `runtime`, `displayName`, `task`, `model`, `phase`, `step`, `totalSteps`, timestamps) — the same convention as [ltx-video-swift-mlx](https://github.com/VincentGourbin/ltx-video-swift-mlx), so monitors only need one reader. Manifests left behind by a force-killed process are garbage-collected on the next beacon start via a pid liveness check.
+
+> **Note:** sandboxed apps write inside their container, invisible to external monitors — the beacon targets CLI tools and non-sandboxed apps.
+
 ## Documentation
 
 ### Guides
@@ -247,7 +268,7 @@ See [Small Decoder Benchmark](docs/examples/small-decoder/) for measured perform
 | [LoRA Guide](docs/LoRA.md) | Loading and using LoRA adapters |
 | [LoRA Training Guide](docs/examples/TRAINING_GUIDE.md) | Training parameters, DOP, gradient checkpointing, YAML config |
 | [LoRA Evaluation](docs/examples/evaluate-lora/) | Automated gap analysis and training parameter recommendations |
-| [VLM API](docs/VLM-API.md) | Qwen3.5 VLM — image analysis, comparison, LoRA training setup |
+| [VLM API](docs/VLM-API.md) | VLM providers (Qwen3.5 bundled, Gemma 4 E2B opt-in) — image analysis, comparison, prompt rewriting, LoRA training setup |
 | [Text Encoders](docs/TextEncoders.md) | FluxTextEncoders library API and CLI |
 | [Custom Model Integration](docs/CustomModelIntegration.md) | Integrating custom MLX-compatible models into the framework |
 | [Flux2App Guide](docs/Flux2App.md) | Demo macOS application |

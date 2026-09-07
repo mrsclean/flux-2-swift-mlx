@@ -456,6 +456,25 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// LoRA adapter manager
     private var loraManager: LoRAManager?
 
+    /// Source directory the transformer weights were resolved from (set by
+    /// `loadTransformer`) — anchor for pre-quantized checkpoint exports.
+    private var transformerSourcePath: URL?
+
+    /// When set, `loadTransformer` ignores any pre-quantized checkpoint and
+    /// loads from the source weights. Used by exports to guarantee the
+    /// result is derived from the source, never from a previous export.
+    private var skipPrequantizedCheckpoint = false
+
+    /// Whether the currently loaded transformer came from a pre-quantized
+    /// checkpoint (informational; also guards export round-trips).
+    public private(set) var transformerLoadedFromPrequantized = false
+
+    /// Whether LoRA weights have been merged into the CURRENT transformer
+    /// instance. Unlike `loraManager.count`, this survives `unloadLoRA` —
+    /// merged weights cannot be un-merged without reloading the base model,
+    /// so this is the flag export safety checks must consult.
+    public private(set) var transformerHasMergedLoRAs = false
+
     /// Active LoRA scheduler overrides (from loaded LoRA config)
     private var loraSchedulerOverrides: SchedulerOverrides?
 
@@ -525,6 +544,122 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// strength, spatial fade). Default 0 = treat every reference as
     /// a donor (no-op vs. pre-2026-05-22 behavior).
     public var canvasReferenceCount: Int = 0
+
+    /// Compile the denoising transformer forward with `MLX.compile`.
+    ///
+    /// **Opt-in, experimental — OFF by default, and there is currently no
+    /// reason to enable it in production.** Measured on klein-9b bf16
+    /// (1 MP, 4 steps, M3 Max 96 GB, 2026-07): steady-state step time is
+    /// unchanged (13.2 s compiled vs 12.5–13.6 s baseline) because this
+    /// codebase already hand-optimizes the elementwise hot spots that
+    /// `compile` would fuse (modulation precomputed outside the block loop,
+    /// fused RoPE Metal kernel, `MLXFast` rmsNorm/SDPA); the remaining step
+    /// time is GEMM/SDPA-bound, which `compile` does not accelerate. The
+    /// output is numerically identical to the uncompiled path (mean RGB
+    /// delta 0.01/255 at equal seed).
+    ///
+    /// The switch is kept for experimentation (future mlx-swift versions,
+    /// other model variants, modified forward paths). Behaviour when
+    /// enabled:
+    /// - the compiled closure is cached on the pipeline; MLX re-traces it
+    ///   automatically when input shapes change (resolution, text length)
+    ///   and it is rebuilt if the transformer instance or guidance arity
+    ///   changes. First step after a (re)build pays a one-time trace
+    ///   (~1–2 s on klein-9b).
+    /// - `memoryOptimization` is forced to `.disabled` on the transformer:
+    ///   intra-forward `eval()` graph segmentation is illegal under compile
+    ///   tracing. Peak memory therefore rises to the unsegmented level —
+    ///   do NOT combine with low-memory profiles on constrained machines.
+    /// - the KV-cached path (`klein-9b-kv`) is not affected.
+    public var compileDenoisingStep: Bool = false
+
+    /// Cached compiled forward (see `compileDenoisingStep`).
+    private var compiledForward: (([MLXArray]) -> [MLXArray])?
+    /// Identity key of the compiled closure: transformer instance + guidance arity.
+    private var compiledForwardKey: (transformer: ObjectIdentifier, hasGuidance: Bool)?
+
+    /// Transformer forward used by the standard denoising loops. Routes
+    /// through the compiled closure when `compileDenoisingStep` is set,
+    /// otherwise calls the transformer directly.
+    private func denoiseForward(
+        _ transformer: Flux2Transformer2DModel,
+        hiddenStates: MLXArray,
+        encoderHiddenStates: MLXArray,
+        timestep: MLXArray,
+        guidance: MLXArray?,
+        imgIds: MLXArray,
+        txtIds: MLXArray,
+        refScaling: Flux2RefScalingContext? = nil   // K4D LOCAL PATCH (Phase D)
+    ) -> MLXArray {
+        // K4D LOCAL PATCH (merge of upstream #113, 2026-09-07): the
+        // per-block reference-scaling context carries an MLXArray
+        // multiplier that is NOT one of the traced inputs, so a compiled
+        // closure would bake the first render's multiplier into the
+        // trace. Whenever the context is active, take the direct path —
+        // `compileDenoisingStep` is opt-in/experimental and measured
+        // neutral upstream, so nothing is lost.
+        guard compileDenoisingStep, refScaling == nil else {
+            return transformer.callAsFunction(
+                hiddenStates: hiddenStates,
+                encoderHiddenStates: encoderHiddenStates,
+                timestep: timestep,
+                guidance: guidance,
+                imgIds: imgIds,
+                txtIds: txtIds,
+                refScaling: refScaling
+            )
+        }
+
+        let hasGuidance = guidance != nil
+        let key = (transformer: ObjectIdentifier(transformer), hasGuidance: hasGuidance)
+        if compiledForward == nil || compiledForwardKey! != key {
+            Flux2Debug.log("Compiling denoising forward (guidance: \(hasGuidance))...")
+            // Intra-forward eval() (memory-optimization graph segmentation) is
+            // illegal inside compile tracing — and pointless once the graph is
+            // compiled. Disable it for this transformer; peak memory rises to
+            // the unsegmented level, which is the trade-off of compiling.
+            if transformer.memoryOptimization != .disabled {
+                Flux2Debug.log("compileDenoisingStep: overriding memoryOptimization \(transformer.memoryOptimization) → .disabled (intra-forward eval is incompatible with compile)")
+                transformer.memoryOptimization = .disabled
+            }
+            // Weights are tracked as compile state via `inputs: [transformer]`,
+            // so LoRA merges (value-only updates) don't stale the trace.
+            compiledForward = compile(inputs: [transformer]) { (arrays: [MLXArray]) -> [MLXArray] in
+                [transformer.callAsFunction(
+                    hiddenStates: arrays[0],
+                    encoderHiddenStates: arrays[1],
+                    timestep: arrays[2],
+                    guidance: hasGuidance ? arrays[3] : nil,
+                    imgIds: hasGuidance ? arrays[4] : arrays[3],
+                    txtIds: hasGuidance ? arrays[5] : arrays[4]
+                )]
+            }
+            compiledForwardKey = key
+        }
+
+        var args = [hiddenStates, encoderHiddenStates, timestep]
+        if let guidance { args.append(guidance) }
+        args.append(imgIds)
+        args.append(txtIds)
+        return compiledForward!(args)[0]
+    }
+
+    /// Keep the text encoder loaded between generations (default `false`).
+    ///
+    /// By default the pipeline is memory-first: the text encoder is loaded,
+    /// used, and unloaded on EVERY generation so it never coexists with the
+    /// transformer. On machines with headroom this re-load is pure waste
+    /// (~1s warm, several seconds cold for the Klein/Qwen3 encoders; much
+    /// more for the Dev/Mistral-24B encoder).
+    ///
+    /// When `true`, the encoder stays resident across generations — the
+    /// text-encoding phase of subsequent generations skips the reload
+    /// entirely. The trade-off is peak memory: encoder + transformer are
+    /// resident simultaneously during denoising (e.g. Klein-9B bf16 +
+    /// Qwen3-8B-4bit ≈ +5 GB). Policy belongs to the host: enable it based
+    /// on available RAM, leave it off on constrained machines. Releasing
+    /// the pipeline instance still frees the encoder as usual.
+    public var keepTextEncoderLoaded: Bool = false
 
     /// Initialize the Flux.2 pipeline
     /// - Parameters:
@@ -613,6 +748,9 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Load all required models
     /// - Parameter progressCallback: Optional callback for download progress
     public func loadModels(progressCallback: Flux2DownloadProgressCallback? = nil) async throws {
+        let beacon = RuntimeBeacon.begin(task: "load-models", model: model.rawValue)
+        defer { beacon?.end() }
+
         // Check memory before loading
         let memCheck = memoryManager.checkTextEncodingPhase(config: quantization)
         if !memCheck.isOk {
@@ -754,61 +892,101 @@ public class Flux2Pipeline: @unchecked Sendable {
             memoryOptimization: memoryOptimization
         )
         Flux2Debug.log("Memory optimization: \(memoryOptimization)")
+        transformerSourcePath = modelPath
+        transformerHasMergedLoRAs = false  // fresh instance, nothing merged yet
 
-        // Load weights with explicit memory management
-        // For large models (Dev), this can temporarily use 2x memory during mapping
-        Flux2Debug.log("Loading transformer weights from disk...")
-        var weights = try Flux2WeightLoader.loadWeights(from: modelPath)
+        // Fast path: a pre-quantized MLX checkpoint exported earlier (see
+        // Flux2PrequantizedCheckpoint / `flux2 export-quantized`) skips the
+        // bf16 read, the key mapping, and the quantize pass entirely. Its
+        // validation runs BEFORE any model mutation, so on failure the same
+        // pristine instance falls through to the standard path below.
+        // Exports set `skipPrequantizedCheckpoint` to guarantee the result
+        // derives from the source weights, never from a previous export.
+        var loadedFromPrequantized = false
+        if quantization.transformer != .bf16, !skipPrequantizedCheckpoint {
+            loadedFromPrequantized = Flux2PrequantizedCheckpoint.load(
+                into: transformer!,
+                makeStructureClone: {
+                    Flux2Transformer2DModel(
+                        config: self.model.transformerConfig,
+                        memoryOptimization: self.memoryOptimization)
+                },
+                sourceModelPath: modelPath,
+                quantization: quantization.transformer
+            )
+            if loadedFromPrequantized {
+                memoryManager.fullCleanup()
+            }
+        }
+        transformerLoadedFromPrequantized = loadedFromPrequantized
 
-        Flux2Debug.log("Applying weights to model...")
-        try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer!)
+        if !loadedFromPrequantized {
+            // Load weights with explicit memory management
+            // For large models (Dev), this can temporarily use 2x memory during mapping
+            Flux2Debug.log("Loading transformer weights from disk...")
+            var weights = try Flux2WeightLoader.loadWeights(from: modelPath)
 
-        // Explicitly release the raw weights dictionary to free memory
-        // This is important for Dev model where weights can be ~32GB
-        weights.removeAll()
-        eval([])  // Sync to ensure weights are released
-        memoryManager.fullCleanup()
-        Flux2Debug.log("Raw weights released from memory")
+            Flux2Debug.log("Applying weights to model...")
+            try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer!)
 
-        // Quantize transformer to native MLX QuantizedLinear if requested
-        // This handles both:
-        // 1. Pre-quantized weights (quanto→float16→MLX qint8): negligible precision loss
-        // 2. On-the-fly quantization from bf16 (e.g. Klein 9B qint8, any model int4)
-        // The quantization uses MLX's native QuantizedLinear format which:
-        // - Reduces memory usage proportionally to bit width (8-bit: ~50%, 4-bit: ~75%)
-        // - Uses optimized quantizedMM() for faster inference on Apple Silicon
-        // - Enables efficient dequant→merge→requant for LoRA weight merging
-        if quantization.transformer != .bf16 {
-            let bits = quantization.transformer.bits
-            let groupSize = quantization.transformer.groupSize
-            let mode = quantization.transformer.mode
-            Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize), mode=\(mode.rawValue))...")
-            memoryManager.logMemoryState()
-            quantize(model: transformer!, groupSize: groupSize, bits: bits, mode: mode)
-            eval(transformer!.parameters())
+            // Explicitly release the raw weights dictionary to free memory
+            // This is important for Dev model where weights can be ~32GB
+            weights.removeAll()
+            eval([])  // Sync to ensure weights are released
             memoryManager.fullCleanup()
-            memoryManager.logMemoryState()
-            Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit, \(mode.rawValue))")
+            Flux2Debug.log("Raw weights released from memory")
+
+            // Quantize transformer to native MLX QuantizedLinear if requested
+            // This handles both:
+            // 1. Pre-quantized weights (quanto→float16→MLX qint8): negligible precision loss
+            // 2. On-the-fly quantization from bf16 (e.g. Klein 9B qint8, any model int4)
+            // The quantization uses MLX's native QuantizedLinear format which:
+            // - Reduces memory usage proportionally to bit width (8-bit: ~50%, 4-bit: ~75%)
+            // - Uses optimized quantizedMM() for faster inference on Apple Silicon
+            // - Enables efficient dequant→merge→requant for LoRA weight merging
+            if quantization.transformer != .bf16 {
+                let bits = quantization.transformer.bits
+                let groupSize = quantization.transformer.groupSize
+                let mode = quantization.transformer.mode
+                Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize), mode=\(mode.rawValue))...")
+                memoryManager.logMemoryState()
+                quantize(model: transformer!, groupSize: groupSize, bits: bits, mode: mode)
+                eval(transformer!.parameters())
+                memoryManager.fullCleanup()
+                memoryManager.logMemoryState()
+                Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit, \(mode.rawValue))")
+            }
         }
 
-        // Merge LoRA weights if any are loaded
+        // Merge LoRA weights if any are loaded — common tail, shared by both
+        // load paths so their behavior cannot drift.
         if let loraManager = loraManager, loraManager.count > 0 {
-            MLX.Memory.peakMemory = 0
-            Flux2Debug.log("[LoRA] Before merge:")
-            memoryManager.logMemoryState()
-            Flux2WeightLoader.mergeLoRAWeights(from: loraManager, into: transformer!)
-            // Free LoRA matrices from memory after fusion (they're now baked into base weights)
-            loraManager.clearWeightsAfterFusion()
-            memoryManager.fullCleanup()
-            Flux2Debug.log("[LoRA] After merge:")
-            memoryManager.logMemoryState()
+            if loraManager.loadedLayerPaths.isEmpty {
+                // A previous fusion already consumed the LoRA weights
+                // (clearWeightsAfterFusion). This freshly loaded transformer
+                // holds BASE weights only — merging would silently no-op
+                // while hasLoRA still reports LoRAs active.
+                Flux2Debug.warning(
+                    "[LoRA] \(loraManager.count) LoRA(s) registered but their weights were already fused into a previous transformer instance and cleared — the reloaded transformer has NO LoRA applied. Reload the LoRA adapters to re-merge.")
+            } else {
+                MLX.Memory.peakMemory = 0
+                Flux2Debug.log("[LoRA] Before merge:")
+                memoryManager.logMemoryState()
+                Flux2WeightLoader.mergeLoRAWeights(from: loraManager, into: transformer!)
+                // Free LoRA matrices from memory after fusion (they're now baked into base weights)
+                loraManager.clearWeightsAfterFusion()
+                transformerHasMergedLoRAs = true
+                memoryManager.fullCleanup()
+                Flux2Debug.log("[LoRA] After merge:")
+                memoryManager.logMemoryState()
+            }
         }
 
         // Ensure weights are evaluated
         eval(transformer!.parameters())
 
         memoryManager.logMemoryState()
-        Flux2Debug.log("Transformer loaded successfully")
+        Flux2Debug.log("Transformer loaded successfully\(loadedFromPrequantized ? " (pre-quantized checkpoint)" : "")")
     }
 
     // MARK: - LoRA Support
@@ -858,6 +1036,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2WeightLoader.mergeLoRAWeights(from: loraManager!, into: transformer)
             // Free LoRA matrices from memory after fusion (they're now baked into base weights)
             loraManager!.clearWeightsAfterFusion()
+            transformerHasMergedLoRAs = true
         }
 
         return info
@@ -935,9 +1114,106 @@ public class Flux2Pipeline: @unchecked Sendable {
         Flux2Debug.log("VAE loaded successfully (\(vaeVariant.displayName), decoder: \(vaeConfig.effectiveDecoderChannels))")
     }
 
+    /// Export the transformer as a pre-quantized MLX checkpoint next to its
+    /// source weights, so subsequent loads with the same quantization skip
+    /// the bf16 read and the quantize pass (see `Flux2PrequantizedCheckpoint`).
+    ///
+    /// The export always derives from the SOURCE weights (never from a
+    /// previous export): the fast path is disabled for the internal load and
+    /// a checkpoint-loaded resident transformer is dropped first. If a
+    /// checkpoint already exists, the call is a no-op returning its URL
+    /// unless `force` is set. Requires a non-bf16 transformer quantization.
+    /// The write is explicit by design — call this from the host when
+    /// trading disk for load time is wanted (roughly the quantized model
+    /// size on disk, e.g. ~9.6 GB for Klein 9B qint8). Delete the model's
+    /// `mlx-prequantized/` subdirectory to reclaim the space.
+    ///
+    /// - Parameters:
+    ///   - allowLoRABaked: the bake check runs AFTER the load against
+    ///     `transformerHasMergedLoRAs` (merged weights survive `unloadLoRA`);
+    ///     when allowed, the export is tagged `lora_baked` in metadata and
+    ///     `load` warns loudly on every use.
+    ///   - force: delete and regenerate an existing checkpoint.
+    /// - Returns: URL of the written (or already existing) safetensors file.
+    @discardableResult
+    public func exportPrequantizedTransformer(
+        allowLoRABaked: Bool = false,
+        force: Bool = false
+    ) async throws -> URL {
+        guard quantization.transformer != .bf16 else {
+            throw Flux2Error.invalidConfiguration(
+                "exportPrequantizedTransformer requires a quantized transformer configuration (current: bf16)")
+        }
+
+        let beacon = RuntimeBeacon.begin(task: "export-quantized", model: model.rawValue)
+        defer { beacon?.end() }
+
+        // Resolve the source directory up-front (same resolution as
+        // loadTransformer) so the exists/force decision precedes any load.
+        let variant = ModelRegistry.TransformerVariant.variant(
+            for: model, quantization: quantization.transformer)
+        guard let sourcePath = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) else {
+            throw Flux2Error.modelNotLoaded(
+                "\(model.displayName) transformer weights not found — download the model before exporting")
+        }
+
+        if Flux2PrequantizedCheckpoint.exists(
+            sourceModelPath: sourcePath, quantization: quantization.transformer)
+        {
+            // Without force, only a VALID existing checkpoint is a no-op; an
+            // invalid/stale squatter is regenerated (the load-side warning
+            // tells users to re-run the export — that advice must work).
+            if !force,
+               Flux2PrequantizedCheckpoint.isValid(
+                   sourceModelPath: sourcePath, quantization: quantization.transformer)
+            {
+                let url = Flux2PrequantizedCheckpoint.weightsURL(
+                    sourceModelPath: sourcePath, quantization: quantization.transformer)
+                Flux2Debug.log(
+                    "Pre-quantized checkpoint already exists and is valid — nothing to do (pass force to regenerate from the source weights): \(url.path)")
+                return url
+            }
+            Flux2PrequantizedCheckpoint.remove(
+                sourceModelPath: sourcePath, quantization: quantization.transformer)
+        }
+
+        // The export must derive from the SOURCE weights, never from a
+        // previous export: drop a checkpoint-loaded resident transformer and
+        // disable the fast path for the (re)load below.
+        if transformerLoadedFromPrequantized {
+            unloadTransformer()
+        }
+        skipPrequantizedCheckpoint = true
+        defer { skipPrequantizedCheckpoint = false }
+        try await loadTransformer()
+
+        guard let transformer, let loadedSourcePath = transformerSourcePath else {
+            throw Flux2Error.modelNotLoaded("Transformer not loaded — cannot export")
+        }
+        // Bake check AFTER the load, against the instance actually being
+        // saved: `transformerHasMergedLoRAs` survives unloadLoRA (merged
+        // weights cannot be un-merged) and covers merges that happened
+        // during the load above — `loraManager.count` alone covers neither.
+        if !allowLoRABaked, transformerHasMergedLoRAs {
+            throw Flux2Error.invalidConfiguration(
+                "The loaded transformer contains merged LoRA weights (merges survive unloadLoRA) — the export would bake them into the base checkpoint for every future load. Pass allowLoRABaked: true only if that is intended.")
+        }
+        return try Flux2PrequantizedCheckpoint.save(
+            model: transformer,
+            sourceModelPath: loadedSourcePath,
+            quantization: quantization.transformer,
+            loRABaked: transformerHasMergedLoRAs)
+    }
+
     /// Unload transformer to free memory
     private func unloadTransformer() {
+        // The compiled forward retains the transformer (and its weights) —
+        // drop it first or the unload frees nothing.
+        compiledForward = nil
+        compiledForwardKey = nil
         transformer = nil
+        transformerHasMergedLoRAs = false
+        transformerLoadedFromPrequantized = false
         memoryManager.clearCache()
     }
 
@@ -1292,6 +1568,19 @@ public class Flux2Pipeline: @unchecked Sendable {
         onCheckpoint: Flux2CheckpointCallback?,
         onStep: Flux2StepHook? = nil
     ) async throws -> Flux2GenerationResult {
+        let beacon = RuntimeBeacon.begin(task: "generate", model: model.rawValue)
+        defer { beacon?.end() }
+        let userProgress = onProgress
+        let onProgress: Flux2ProgressCallback?
+        if let beacon {
+            onProgress = { step, totalSteps in
+                beacon.update(phase: "denoising", step: step, totalSteps: totalSteps)
+                userProgress?(step, totalSteps)
+            }
+        } else {
+            onProgress = userProgress
+        }
+
         // Validate dimensions
         let (validHeight, validWidth) = LatentUtils.validateDimensions(
             height: height,
@@ -1344,6 +1633,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("Pre-computed embeddings shape: \(precomputed.shape)")
         } else {
             Flux2Debug.log("=== PHASE 1: Text Encoding ===")
+            beacon?.update(phase: "text-encoding")
 
             MemoryConfig.applyCacheLimit(bytes: phaseLimits.textEncoding)
 
@@ -1511,9 +1801,16 @@ public class Flux2Pipeline: @unchecked Sendable {
 
             Flux2Debug.log("Text embeddings shape: \(textEmbeddings.shape)")
 
-            // Unload text encoder to free memory
+            // Unload text encoder to free memory — unless the host opted
+            // into keeping it resident (`keepTextEncoderLoaded`), in which
+            // case only the GPU buffer cache is dropped before denoising.
             profiler.start("3. Unload Text Encoder")
-            await unloadTextEncoder()
+            if keepTextEncoderLoaded {
+                Flux2Debug.log("Keeping text encoder resident (keepTextEncoderLoaded)")
+                memoryManager.fullCleanup()
+            } else {
+                await unloadTextEncoder()
+            }
             profiler.end("3. Unload Text Encoder")
         }
 
@@ -1597,6 +1894,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("Generated output noise latents: \(patchifiedLatents.shape)")
 
             // Encode ALL reference images
+            profiler.start("5b. VAE Encode References")
             let (referenceLatents, referencePositionIds, refTokenMultiplier) = try await encodeReferenceImages(
                 images,
                 height: validHeight,
@@ -1604,6 +1902,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                 maxReferencePixels: maxReferencePixels
             )
             eval(referenceLatents)
+            profiler.end("5b. VAE Encode References")
             Flux2Debug.log("Encoded \(images.count) reference images: latents \(referenceLatents.shape), posIds \(referencePositionIds.shape)")
 
             // Pack output latents to sequence format
@@ -1864,7 +2163,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                     refStrengthCtxCandidate.isActive ? refStrengthCtxCandidate : nil
 
                 // Run transformer (conditional pass)
-                let noisePredCond = transformer.callAsFunction(
+                let noisePredCond = denoiseForward(
+                    transformer,
                     hiddenStates: inputLatents,
                     encoderHiddenStates: textEmbeddings,
                     timestep: t,
@@ -1880,7 +2180,8 @@ public class Flux2Pipeline: @unchecked Sendable {
                 if useClassicalCFG,
                    let negEmbeds = negativeTextEmbeddings,
                    let uncondIds = i2iUncondTextIds {
-                    let noisePredUncond = transformer.callAsFunction(
+                    let noisePredUncond = denoiseForward(
+                        transformer,
                         hiddenStates: inputLatents,
                         encoderHiddenStates: negEmbeds,
                         timestep: t,
@@ -1991,6 +2292,12 @@ public class Flux2Pipeline: @unchecked Sendable {
                 throw Flux2Error.generationFailed("Failed to convert VAE output to image")
             }
             profiler.end("8. Post-processing")
+
+            // End-of-generation hygiene: drop the transient GPU buffer cache
+            // (~3 GB measured after a 1 MP run). For a resident host app this
+            // is dead weight between generations; the next run re-warms it in
+            // milliseconds.
+            memoryManager.clearCache()
 
             if profiler.isEnabled {
                 print(profiler.generateReport())
@@ -2363,7 +2670,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
 
             // Run transformer (conditional pass)
-            let noisePredCond = transformer.callAsFunction(
+            let noisePredCond = denoiseForward(
+                transformer,
                 hiddenStates: packedLatents,
                 encoderHiddenStates: textEmbeddings,
                 timestep: t,
@@ -2378,7 +2686,8 @@ public class Flux2Pipeline: @unchecked Sendable {
             if useClassicalCFG,
                let negEmbeds = negativeTextEmbeddings,
                let uncondIds = uncondTextIds {
-                let noisePredUncond = transformer.callAsFunction(
+                let noisePredUncond = denoiseForward(
+                    transformer,
                     hiddenStates: packedLatents,
                     encoderHiddenStates: negEmbeds,
                     timestep: t,
@@ -2499,6 +2808,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
         // === PHASE 3: Decode to Image ===
         Flux2Debug.log("=== PHASE 3: VAE Decoding ===")
+        beacon?.update(phase: "vae-decode")
 
         // MEMORY OPTIMIZATION: Set cache limit for VAE decoding phase
         MemoryConfig.applyCacheLimit(bytes: phaseLimits.vaeDecoding)
@@ -2514,6 +2824,9 @@ public class Flux2Pipeline: @unchecked Sendable {
             throw Flux2Error.imageProcessingFailed("Failed to convert output to image")
         }
         profiler.end("8. Post-processing")
+
+        // End-of-generation hygiene: see the I2I return path above.
+        memoryManager.clearCache()
 
         Flux2Debug.log("Generation complete!")
         memoryManager.logMemoryState()

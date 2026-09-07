@@ -406,6 +406,44 @@ flux2 download --transformer-quant bf16
 
 ---
 
+## Pre-Quantized Checkpoints (`export-quantized`)
+
+On-the-fly quantization re-pays, at every load, the full bf16 read (17 GB
+for Klein 9B) plus a quantize pass. `export-quantized` writes an MLX-native
+pre-quantized checkpoint next to the source weights; subsequent loads with
+the same model/quantization pick it up **automatically** and skip both.
+
+```bash
+# One-time export (pays the standard load once, then writes ~9.6 GB)
+flux2 export-quantized --flux-model klein-9b --transformer-quant qint8
+# From now on, any qint8 load of klein-9b uses it automatically.
+```
+
+- Biggest win on machines whose page cache cannot hold the bf16 file
+  (16–32 GB Macs): every load there is a cold load, and the checkpoint
+  halves the bytes read on top of skipping the quantize pass.
+- Output is bit-identical to the on-the-fly path (quantization is
+  deterministic; verified at equal seed).
+- Layout: `<model dir>/mlx-prequantized/<quant>/transformer.safetensors`,
+  with validation before any model mutation — payload integrity (truncation
+  detection), metadata identity (bits/group size/mode/source + a source
+  fingerprint that detects re-downloaded base weights), key sets, and tensor
+  shapes — and automatic fallback to the standard path on any mismatch.
+  Writes are atomic (temp file + rename). Delete the `mlx-prequantized/`
+  subdirectory to reclaim disk space.
+- Re-running the command is a fast no-op while a valid checkpoint exists;
+  pass `--force` to regenerate from the source weights (exports never derive
+  from a previous export).
+- Library API: `Flux2Pipeline.exportPrequantizedTransformer(force:)`. LoRA
+  safety: the export refuses when LoRA weights are merged into the loaded
+  transformer (`transformerHasMergedLoRAs`, which survives `unloadLoRA`)
+  unless `allowLoRABaked: true` — such exports are tagged `lora_baked` in
+  metadata and warned about on every load.
+- Works for all quantized modes (`qint8`, `int4`, `mxfp8`, `mxfp4`,
+  `nvfp4`) — fp modes have no `.biases` tensors, which is expected.
+
+---
+
 ## LoRA Adapters
 
 Apply LoRA (Low-Rank Adaptation) weights to customize model behavior for specific tasks.
@@ -502,6 +540,48 @@ Model Status:
 | Memory Efficient | 4bit | qint8 | ~47GB | 64GB Macs |
 | Minimal | 4bit | qint8 | ~47GB | 48GB Macs |
 | Ultra-Minimal | 4bit | int4 | ~30GB | 32GB Macs |
+
+> **Quantization ≠ speed.** Measured on klein-9b (M3 Max, 1 MP, 4 steps):
+> qint8 steps are NOT faster than bf16 (~14.9 vs ~13.6 s/step) — the
+> denoising step is large-GEMM-bound, unlike LLM decode. Quantization buys
+> **memory**, not step time. Quality on klein-**9B** qint8 is near-identical
+> to bf16 (mean RGB delta 1.7/255 at equal seed); the historical qint8
+> color-drift affects klein-**4B**. Avoid `mxfp8` for inference on 9B: ~2×
+> slower AND visibly degraded (as of mlx-swift 0.31.6 / core 0.31.1).
+
+---
+
+## Benchmarking & Experimental Flags (`inpaint`)
+
+Flags added for performance investigation — useful to reproduce app
+generations and separate cold-start from steady-state:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--profile` | false | Per-phase report: model loads, text encoding, VAE encodes (source + references), per-step timings, decode, composite |
+| `--repeat-count <n>` | 1 | Run the chain N times in one process (run 1 = cold: file cache, kernel JIT; runs 2+ = steady-state) |
+| `--cleanup-between-runs` | false | Clear the MLX buffer cache between repeated runs (diagnostic) |
+| `--compile-step` | false | **Experimental, benchmarking only.** Compile the denoising forward with `MLX.compile` |
+
+### `--compile-step` — read before enabling
+
+Measured neutral on klein-9b bf16 (steady-state 13.2 s/step compiled vs
+12.5–13.6 s baseline; output numerically identical, mean RGB delta
+0.01/255): the elementwise chains `compile` would fuse (AdaLN modulation,
+gates, RoPE arithmetic) are already hand-optimized in this codebase, and the
+remaining step time is GEMM/SDPA-bound. The switch is kept for
+experimentation with future mlx-swift versions or modified forward paths.
+
+Side effects when enabled:
+- the transformer's `memoryOptimization` is forced to `.disabled`
+  (intra-forward `eval()` segmentation is illegal under compile tracing) —
+  **peak memory rises**; do not combine with low-memory configurations;
+- the first step after each (re)trace pays ~1–2 s (new resolution, text
+  length, or transformer instance triggers a re-trace);
+- the KV-cached path (`klein-9b-kv`) is unaffected.
+
+Library equivalent: `Flux2Pipeline.compileDenoisingStep = true` (see the
+property's doc comment in `Flux2Pipeline.swift`).
 
 ---
 

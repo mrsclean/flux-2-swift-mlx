@@ -545,6 +545,16 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// a donor (no-op vs. pre-2026-05-22 behavior).
     public var canvasReferenceCount: Int = 0
 
+    // K4D LOCAL PATCH — reference-budget scope (2026-09-07).
+    /// When `true`, `maxReferencePixels` (the reference-grid budget)
+    /// coarsens canvas references too. Default `false` keeps the
+    /// 2026-09-04 rule: donors only, canvas never below 1024². K4D
+    /// turns it on — the dial's purpose is coarsening the image being
+    /// restyled, which in the app sits in the Canvas slot; the v65
+    /// sweeps that established the dial were single-image renders
+    /// where that image was the only reference.
+    public var referenceBudgetAppliesToCanvas: Bool = false
+
     /// Compile the denoising transformer forward with `MLX.compile`.
     ///
     /// **Opt-in, experimental — OFF by default, and there is currently no
@@ -2942,11 +2952,14 @@ public class Flux2Pipeline: @unchecked Sendable {
             let pixelCount = targetWidth * targetHeight
 
             // K4D LOCAL PATCH (2026-09-04, reference grid): the encode
-            // budget is a DONOR control. Canvas refs are the render
-            // target and are never coarsened below the historical 1024²
-            // — the dial can only lower donors. A caller raising the
-            // budget above 1024² still lifts both.
-            let budgetArea = isDonorRef ? maxImageArea : max(maxImageArea, 1024 * 1024)
+            // budget applies to donors; canvas refs keep the historical
+            // 1024² floor UNLESS `referenceBudgetAppliesToCanvas` is set
+            // (2026-09-07 — K4D sets it: the dial coarsens the image
+            // being restyled). A caller raising the budget above 1024²
+            // still lifts both.
+            let budgetArea = (isDonorRef || referenceBudgetAppliesToCanvas)
+                ? maxImageArea
+                : max(maxImageArea, 1024 * 1024)
             if pixelCount > budgetArea {
                 let scale = sqrt(Double(budgetArea) / Double(pixelCount))
                 targetWidth = Int(Double(targetWidth) * scale)
